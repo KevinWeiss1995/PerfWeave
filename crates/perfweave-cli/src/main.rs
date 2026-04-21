@@ -158,7 +158,7 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
     if !args.no_open {
         let url = format!("http://{}/", args.api_listen.replace("0.0.0.0", "localhost"));
         if let Err(e) = open_browser(&url) {
-            tracing::warn!(error=%e, "could not open browser; visit {url}");
+            tracing::info!(url = %url, reason = %e, "PerfWeave UI ready; open this URL manually");
         }
     }
 
@@ -191,12 +191,29 @@ async fn cmd_import(args: ImportArgs) -> Result<()> {
 }
 
 fn open_browser(url: &str) -> Result<()> {
+    // On headless Linux (no DISPLAY / WAYLAND_DISPLAY) don't even try —
+    // xdg-open will print "Error: no DISPLAY..." to stderr which looks
+    // like a real failure in the logs. Caller has already printed the URL.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("DISPLAY").is_none()
+            && std::env::var_os("WAYLAND_DISPLAY").is_none()
+        {
+            anyhow::bail!("headless (no DISPLAY); not opening a browser");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     let prog = "xdg-open";
     #[cfg(target_os = "macos")]
     let prog = "open";
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let prog = "cmd";
-    std::process::Command::new(prog).arg(url).spawn()?;
+
+    std::process::Command::new(prog)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
     Ok(())
 }

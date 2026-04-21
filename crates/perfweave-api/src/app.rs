@@ -53,7 +53,13 @@ pub fn make_router(services: Services) -> Router {
         .layer(TraceLayer::new_for_http());
 
     if let Some(dir) = services.web_dir.as_ref() {
-        router = router.nest_service("/", tower_http::services::ServeDir::new(dir));
+        // axum 0.8 forbids `nest_service("/", ...)`. `fallback_service` is
+        // the documented replacement: any route not matched above falls
+        // through to ServeDir, which resolves `/` to `index.html`.
+        router = router.fallback_service(
+            tower_http::services::ServeDir::new(dir)
+                .append_index_html_on_directories(true),
+        );
     }
     router
 }
