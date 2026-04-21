@@ -171,6 +171,12 @@ async fn insert<T: Row + Serialize>(
 // the order derived from the Row impl.
 // ---------------------------------------------------------------------------
 
+// IMPORTANT: `category` and `memcpy_kind` are `Enum8` in ClickHouse. In
+// the RowBinary wire format an Enum8 is a single signed byte (the
+// discriminant). Serializing them as `String` here causes silent column
+// misalignment that eventually explodes as
+// `Too large string size: ... (TOO_LARGE_STRING_SIZE)` when enough drift
+// accumulates to hit a real String column with a garbage length prefix.
 #[derive(Row, Serialize, Debug)]
 pub struct EventRow {
     ts_ns: u64,
@@ -181,7 +187,7 @@ pub struct EventRow {
     tid: u32,
     ctx_id: u32,
     stream_id: u32,
-    category: String,
+    category: i8,
     name_id: u64,
     correlation_id: u64,
     parent_id: u64,
@@ -199,7 +205,7 @@ pub struct EventRow {
     registers: u32,
     local_mem: u32,
     launch_cbid: u32,
-    memcpy_kind: String,
+    memcpy_kind: i8,
     memcpy_bytes: u64,
     memcpy_src: u32,
     memcpy_dst: u32,
@@ -219,7 +225,7 @@ impl From<perfweave_proto::v1::Event> for EventRow {
             tid: e.tid,
             ctx_id: e.ctx_id,
             stream_id: e.stream_id,
-            category: category_to_str(e.category()).to_string(),
+            category: category_to_i8(e.category()),
             name_id: e.name_id,
             correlation_id: e.correlation_id,
             parent_id: e.parent_id,
@@ -230,7 +236,7 @@ impl From<perfweave_proto::v1::Event> for EventRow {
             block_x: 0, block_y: 0, block_z: 0,
             shared_static: 0, shared_dynamic: 0,
             registers: 0, local_mem: 0, launch_cbid: 0,
-            memcpy_kind: "UNKNOWN".to_string(),
+            memcpy_kind: 0, // UNKNOWN
             memcpy_bytes: 0, memcpy_src: 0, memcpy_dst: 0,
             api_cbid: 0, api_status: 0,
         };
@@ -250,7 +256,7 @@ impl From<perfweave_proto::v1::Event> for EventRow {
                 row.launch_cbid = k.launch_cbid;
             }
             Some(Payload::Memcpy(m)) => {
-                row.memcpy_kind = memcpy_kind_to_str(m.kind()).to_string();
+                row.memcpy_kind = memcpy_kind_to_i8(m.kind());
                 row.memcpy_bytes = m.bytes;
                 row.memcpy_src = m.src_device;
                 row.memcpy_dst = m.dst_device;
@@ -265,29 +271,32 @@ impl From<perfweave_proto::v1::Event> for EventRow {
     }
 }
 
-fn category_to_str(c: Category) -> &'static str {
+// Values MUST match the Enum8 definitions in migrations/0001_events.sql.
+// If you change them there, change them here (or the CH server will reject
+// the byte with a "Unknown element ... for type Enum" error).
+fn category_to_i8(c: Category) -> i8 {
     match c {
-        Category::Unspecified => "METRIC", // fall back; never emitted in practice
-        Category::Metric => "METRIC",
-        Category::ApiCall => "API_CALL",
-        Category::Kernel => "KERNEL",
-        Category::Memcpy => "MEMCPY",
-        Category::Memset => "MEMSET",
-        Category::Sync => "SYNC",
-        Category::Overhead => "OVERHEAD",
-        Category::Marker => "MARKER",
+        Category::Unspecified => 1, // fall back to METRIC; never emitted in practice
+        Category::Metric => 1,
+        Category::ApiCall => 2,
+        Category::Kernel => 3,
+        Category::Memcpy => 4,
+        Category::Memset => 5,
+        Category::Sync => 6,
+        Category::Overhead => 7,
+        Category::Marker => 8,
     }
 }
 
-fn memcpy_kind_to_str(k: perfweave_proto::v1::memcpy_detail::Kind) -> &'static str {
+fn memcpy_kind_to_i8(k: perfweave_proto::v1::memcpy_detail::Kind) -> i8 {
     use perfweave_proto::v1::memcpy_detail::Kind;
     match k {
-        Kind::Unknown => "UNKNOWN",
-        Kind::H2d => "H2D",
-        Kind::D2h => "D2H",
-        Kind::D2d => "D2D",
-        Kind::H2h => "H2H",
-        Kind::P2p => "P2P",
+        Kind::Unknown => 0,
+        Kind::H2d => 1,
+        Kind::D2h => 2,
+        Kind::D2d => 3,
+        Kind::H2h => 4,
+        Kind::P2p => 5,
     }
 }
 
