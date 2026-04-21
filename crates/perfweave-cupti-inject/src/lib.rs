@@ -70,6 +70,10 @@ pub extern "C" fn InitializeInjection() -> i32 {
 }
 
 struct Injector {
+    // Read inside `ship()` once CUPTI's `ActivityBufferCompleted` callback is
+    // wired up under the `build` feature. Kept here so we don't reconnect
+    // per-batch.
+    #[allow(dead_code)]
     transport: transport::AgentConn,
 }
 
@@ -78,6 +82,11 @@ static GLOBAL: Mutex<Option<Injector>> = Mutex::new(None);
 /// Called from CUPTI's `ActivityBufferCompleted` callback (via extern C in
 /// activity.rs). Takes ownership of the parsed `Batch` and forwards it to
 /// the agent.
+///
+/// Currently dead on hosts built without the `build` feature: the CUPTI
+/// subscription that drives it is feature-gated. The symbol is kept so the
+/// callback wiring is a drop-in change when the feature is turned on.
+#[allow(dead_code)]
 pub(crate) fn ship(batch: Batch) {
     let mut guard = GLOBAL.lock();
     let Some(injector) = guard.as_mut() else { return };

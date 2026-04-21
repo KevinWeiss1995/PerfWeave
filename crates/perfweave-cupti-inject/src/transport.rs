@@ -5,6 +5,8 @@ use std::io;
 use std::os::unix::net::UnixStream;
 
 pub struct AgentConn {
+    // Written to from `ship()` once the CUPTI callback chain is wired.
+    #[allow(dead_code)]
     pub stream: UnixStream,
 }
 

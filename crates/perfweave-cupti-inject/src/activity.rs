@@ -37,8 +37,11 @@ pub enum ActivityKind {
     Overhead = 27,
 }
 
-// Prefix present on every activity record.
+// Prefix present on every activity record. Only ever constructed by CUPTI
+// itself — we access it by pointer cast in `parse_record`, so rustc can't
+// see it as "constructed" from Rust code.
 #[repr(C)]
+#[allow(dead_code)]
 pub struct ActivityHeader {
     pub kind: u32,
 }
@@ -143,6 +146,10 @@ impl Drop for ActivityBuffer {
 /// # Safety
 /// Caller guarantees `buf` is a valid, initialized activity record produced
 /// by CUPTI. Sizes are validated internally.
+///
+/// Dead on hosts built without the `build` feature; see `lib.rs` for the
+/// subscription that drives this.
+#[allow(dead_code)]
 pub unsafe fn parse_record(buf: *const u8, remaining: usize) -> (usize, Option<Event>) {
     if remaining < std::mem::size_of::<ActivityHeader>() {
         return (remaining, None);
