@@ -22,9 +22,10 @@ CREATE TABLE IF NOT EXISTS spikes
     z_mad           Float64
 )
 ENGINE = MergeTree
-PARTITION BY toYYYYMMDD(toDateTime64(bucket_start_ns / 1e9, 9))
+PARTITION BY toYYYYMMDD(toDateTime(intDiv(bucket_start_ns, 1000000000)))
 ORDER BY (node_id, gpu_id, metric_id, bucket_start_ns)
-TTL toDateTime64(bucket_start_ns / 1e9, 9) + INTERVAL 30 DAY;
+-- TTL expression must return Date/DateTime (not DateTime64) per CH >= 23.x.
+TTL toDateTime(intDiv(bucket_start_ns, 1000000000)) + INTERVAL 30 DAY;
 
 -- A view the UI can SELECT from; the actual refresh is driven by the API
 -- running an INSERT ... SELECT on a timer (ClickHouse lacks a true rolling
