@@ -1,0 +1,146 @@
+syntax = "proto3";
+
+package perfweave.v1;
+
+// Canonical GPU event. Metrics are degenerate events with duration_ns = 0
+// and payload set to a metric_sample. All timestamps are host-corrected
+// monotonic nanoseconds since the unix epoch (see ClockOffset below).
+message Event {
+  fixed64 ts_ns          = 1;
+  fixed64 duration_ns    = 2;
+  uint32  node_id        = 3;
+  uint32  gpu_id         = 4;
+  uint32  pid            = 5;
+  uint32  tid            = 6;
+  uint32  ctx_id         = 7;
+  uint32  stream_id      = 8;
+  Category category      = 9;
+  // 64-bit xxh3 of the string interned in the strings dictionary table.
+  fixed64 name_id        = 10;
+  fixed64 correlation_id = 11;
+  fixed64 parent_id      = 12;
+
+  oneof payload {
+    MetricSample metric  = 20;
+    KernelDetail kernel  = 21;
+    MemcpyDetail memcpy  = 22;
+    ApiCallDetail api    = 23;
+    MarkerDetail marker  = 24;
+  }
+}
+
+enum Category {
+  CATEGORY_UNSPECIFIED = 0;
+  METRIC               = 1;
+  API_CALL             = 2;
+  KERNEL               = 3;
+  MEMCPY               = 4;
+  MEMSET               = 5;
+  SYNC                 = 6;
+  OVERHEAD             = 7;
+  MARKER               = 8;
+}
+
+message MetricSample {
+  // xxh3 of metric name string (e.g. "gpu.util", "mem.bandwidth.bytes_per_sec").
+  fixed64 metric_id = 1;
+  double  value     = 2;
+  // Unit is free-form but convention is SI: "percent", "bytes", "bytes_per_sec",
+  // "watts", "celsius", "hz".
+  string  unit      = 3;
+}
+
+message KernelDetail {
+  uint32 grid_x = 1;
+  uint32 grid_y = 2;
+  uint32 grid_z = 3;
+  uint32 block_x = 4;
+  uint32 block_y = 5;
+  uint32 block_z = 6;
+  uint32 static_shared_mem_bytes = 7;
+  uint32 dynamic_shared_mem_bytes = 8;
+  uint32 registers_per_thread = 9;
+  uint32 local_mem_per_thread = 10;
+  // CUPTI cbid for the launch API call (cuLaunchKernel, cuLaunchCooperativeKernel, etc.).
+  uint32 launch_cbid = 11;
+}
+
+message MemcpyDetail {
+  enum Kind {
+    UNKNOWN = 0;
+    H2D = 1;
+    D2H = 2;
+    D2D = 3;
+    H2H = 4;
+    P2P = 5;
+  }
+  Kind   kind = 1;
+  uint64 bytes = 2;
+  uint32 src_device = 3;
+  uint32 dst_device = 4;
+}
+
+message ApiCallDetail {
+  // CUPTI cbid (CUPTI_RUNTIME_TRACE_CBID_* or CUPTI_DRIVER_TRACE_CBID_*).
+  uint32 cbid = 1;
+  // Return status packed into uint32 (CUresult / cudaError_t).
+  uint32 status = 2;
+}
+
+message MarkerDetail {
+  // NVTX domain string id (interned).
+  fixed64 domain_id = 1;
+  uint32  color_argb = 2;
+}
+
+// Intern a string at the collector once; agents send (id, text) the first
+// time they see a new name and only (id) thereafter.
+message StringIntern {
+  fixed64 id = 1;
+  string  text = 2;
+}
+
+// Agents emit this every ~10s so queries can audit clock correction.
+message ClockOffset {
+  uint32 node_id = 1;
+  uint32 gpu_id  = 2;
+  // Affine mapping: host_ns = slope * gpu_ns + offset_ns.
+  // slope is a ratio expressed as (slope_num / slope_den) to avoid f64 drift.
+  fixed64 offset_ns = 3;
+  fixed64 slope_num = 4;
+  fixed64 slope_den = 5;
+  // Measured residual error in ns (max absolute) of the fit.
+  fixed64 residual_max_ns = 6;
+}
+
+message AgentHello {
+  uint32 node_id = 1;
+  string hostname = 2;
+  string agent_version = 3;
+  uint32 num_gpus = 4;
+}
+
+message Batch {
+  repeated Event          events = 1;
+  repeated StringIntern   strings = 2;
+  repeated ClockOffset    offsets = 3;
+}
+
+message Ack {
+  uint64 accepted = 1;
+  uint64 dropped  = 2;
+}
+
+service Collector {
+  // Agents open a bidirectional stream. Server acks periodically so agents
+  // can trim their ring buffer; flow control is exerted by slow reads.
+  rpc Ingest(stream Batch) returns (stream Ack);
+
+  // One-shot hello before the stream so the collector registers the node.
+  rpc Register(AgentHello) returns (RegisterAck);
+}
+
+message RegisterAck {
+  uint32 assigned_node_id = 1;
+  uint64 server_epoch_ns  = 2;
+}

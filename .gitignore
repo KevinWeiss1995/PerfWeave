@@ -1,0 +1,25 @@
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# web
+web/node_modules/
+web/dist/
+web/.vite/
+
+# clickhouse local data
+var/
+data/
+*.log
+
+# profiler artifacts
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# editor
+.idea/
+.vscode/
+*.swp
+.DS_Store

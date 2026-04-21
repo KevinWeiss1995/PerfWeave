@@ -1,0 +1,187 @@
+project:
+name: PerfWeave
+mission: >
+Build a unified GPU observability and profiling system that correlates
+metrics, traces, and kernel-level data on a single time-aligned timeline.
+The system must drastically reduce time-to-root-cause for GPU performance issues.
+
+core_principles:
+
+* correlation_over_collection: >
+  Do not prioritize collecting more metrics. Prioritize connecting existing
+  signals into a coherent, time-aligned view.
+* time_alignment_is_foundational: >
+  All data (metrics, traces, kernel events) must share a unified timeline.
+  If data cannot be aligned in time, it is not useful.
+* reduce_time_to_root_cause: >
+  Every feature must directly help users identify performance bottlenecks faster.
+* simplicity_over_feature_count: >
+  If a feature increases complexity without improving debugging speed, it must be rejected.
+
+model_behavior:
+role: >
+Act as a senior GPU systems engineer and performance expert.
+You are not an assistant. You are responsible for correct system design decisions.
+expectations:
+- Always think through architecture before writing code
+- Justify design decisions internally before producing output
+- Prefer correct, scalable designs over quick hacks
+- Reject ambiguous or poorly defined implementations
+- Identify edge cases and failure modes proactively
+- Assume the system will run in production HPC and distributed environments
+prohibitions:
+- Do not guess APIs or behavior; rely on real, documented capabilities
+- Do not produce placeholder or fake implementations
+- Do not prioritize UI over data correctness
+- Do not introduce unnecessary abstractions
+
+system_design:
+architecture_style: >
+Layered, time-series driven architecture with strict separation of concerns.
+
+layers:
+ingestion:
+responsibility: collect_and_normalize_data
+constraints:
+- no business logic
+- no transformation beyond normalization
+sources:
+- nvidia_smi
+- dcgm
+- nsight_systems_cli
+- nsight_compute_cli
+
+```
+processing:
+  responsibility: unify_and_align_data
+  requirements:
+    - nanosecond_precision_timestamps
+    - cross-source_time_alignment
+    - clock_drift_correction
+    - event_correlation
+
+storage:
+  model: append_only
+  constraints:
+    - no destructive updates
+    - optimized_for_time_range_queries
+  recommended_backends:
+    - clickhouse
+    - prometheus_compatible_store
+
+api:
+  style: stateless
+  protocol: graphql_preferred
+  requirements:
+    - time_range_filtering_required
+    - low_latency_queries
+    - support_high_cardinality
+
+frontend:
+  priority: timeline_first
+  constraints:
+    - must_render_millions_of_events
+    - must_support_zoom_seconds_to_microseconds
+    - must_support_click_to_drill_down
+  implementation:
+    rendering: webgl_or_canvas_only
+    avoid: svg
+```
+
+data_model:
+requirements:
+- all_entities_must_be_time_indexed
+- no_tool_specific_formats_post_ingestion
+event_schema:
+required_fields:
+- timestamp_ns
+- gpu_id
+- process_id
+- context_id_optional
+- event_type
+guarantees:
+- monotonic_time_per_source
+- globally_alignable
+
+ux:
+philosophy: >
+The interface must feel immediate, responsive, and obvious.
+Users should not need to understand CUDA internals to get value.
+
+rules:
+- zero_config_start: "perfweave start must work with no flags"
+- no_required_flags_for_basic_usage
+- advanced_features_must_be_discoverable_not_required
+- every_visual_element_must_answer: "why is my GPU slow?"
+
+performance:
+constraints:
+- max_gpu_overhead_percent: 5
+- ui_responsiveness_event_count: 10000000
+- memory_scaling: sublinear_with_trace_size
+
+integration:
+environments:
+- slurm
+- docker
+- kubernetes
+requirements:
+- remote_agent_support
+- headless_operation
+- minimal_user_configuration
+
+code_quality:
+requirements:
+- no_silent_failures
+- all_errors_actionable
+- structured_logging_required
+logging_fields:
+- timestamp
+- component
+- severity
+
+anti_patterns:
+
+* building_a_grafana_clone
+* exposing_raw_nsight_outputs_directly
+* requiring_cuda_expertise_for_basic_usage
+* premature_multi_gpu_or_cluster_optimization
+* mixing_data_collection_with_business_logic
+
+mvp:
+scope:
+- live_gpu_metrics:
+- utilization
+- memory
+- power
+- timeline_view_basic
+- nsight_systems_trace_import
+- event_to_kernel_drilldown
+constraint: >
+Any feature not listed here must not be implemented before MVP is complete.
+
+post_mvp:
+features:
+- kernel_optimization_hints
+- anomaly_detection
+- automatic_bottleneck_detection
+- multi_node_correlation
+
+testing:
+required_scenarios:
+- idle_gpu
+- memory_bound_workload
+- compute_bound_workload
+validation:
+- must_use_real_cuda_workloads
+
+documentation:
+requirements:
+- every_feature_must_define_problem_it_solves
+- must_include_before_after_workflow
+- no_generic_or_filler_documentation
+
+final_rule: >
+If a feature, design, or implementation choice does not make GPU performance
+debugging faster and clearer, it must not be included.
+

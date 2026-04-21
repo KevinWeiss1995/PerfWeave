@@ -1,0 +1,47 @@
+[package]
+name = "perfweave-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "perfweave-agent"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Default is zero-GPU so the crate builds on macOS / CI. Real hosts enable
+# `nvml` for NVML, `dcgm` for libdcgm, `cupti` for the LD_PRELOAD injector.
+default = []
+nvml = ["dep:nvml-wrapper"]
+dcgm = []
+cupti = []
+
+[dependencies]
+perfweave-proto = { path = "../perfweave-proto" }
+perfweave-common = { path = "../perfweave-common" }
+
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+tonic.workspace = true
+prost.workspace = true
+async-trait = "0.1"
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+bytes.workspace = true
+
+nvml-wrapper = { workspace = true, optional = true }
+
+[build-dependencies]
+# Only used when cupti feature is enabled; bindgen is pulled in conditionally.

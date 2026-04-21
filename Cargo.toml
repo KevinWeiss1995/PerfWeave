@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/perfweave-common",
+    "crates/perfweave-proto",
+    "crates/perfweave-agent",
+    "crates/perfweave-collector",
+    "crates/perfweave-api",
+    "crates/perfweave-cli",
+    "crates/perfweave-cupti-inject",
+    "crates/perfweave-nsys-import",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/perfweave/perfweave"
+
+[workspace.dependencies]
+# async + errors
+tokio = { version = "1.38", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+anyhow = "1.0"
+thiserror = "1.0"
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# serde + config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# grpc
+tonic = "0.11"
+tonic-build = "0.11"
+prost = "0.12"
+prost-build = "0.12"
+prost-types = "0.12"
+
+# http / graphql
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+async-graphql = { version = "7.0", features = ["chrono"] }
+async-graphql-axum = "7.0"
+
+# clickhouse + arrow
+clickhouse = { version = "0.11", default-features = false, features = ["lz4"] }
+arrow = { version = "55", default-features = false, features = ["ipc"] }
+arrow-ipc = "55"
+
+# cli
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# data
+bytes = "1.6"
+ahash = "0.8"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# NVIDIA
+nvml-wrapper = "0.10"
+
+# numeric
+rand = "0.8"
+rand_distr = "0.4"

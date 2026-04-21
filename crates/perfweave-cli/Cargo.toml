@@ -1,0 +1,33 @@
+[package]
+name = "perfweave-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "perfweave"
+path = "src/main.rs"
+
+[features]
+default = []
+nvml = ["dep:nvml-wrapper"]
+
+[dependencies]
+perfweave-common = { path = "../perfweave-common" }
+perfweave-proto = { path = "../perfweave-proto" }
+perfweave-api = { path = "../perfweave-api" }
+perfweave-collector = { path = "../perfweave-collector" }
+perfweave-agent = { path = "../perfweave-agent" }
+clickhouse.workspace = true
+tonic.workspace = true
+
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+nvml-wrapper = { workspace = true, optional = true }
