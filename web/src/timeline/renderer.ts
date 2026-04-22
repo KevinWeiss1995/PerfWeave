@@ -80,6 +80,12 @@ export class TimelineRenderer {
   private lanes: LaneLayout[] = [];
   private highlightCorrLo = 0;
   private baselineNs = 0n;
+  /** DPR used when the instance buffer was last uploaded. The activity
+   *  instance format bakes `yTopDevicePx` into the buffer, so a DPR change
+   *  (e.g. user drags the window to a retina display, or hot-swaps an
+   *  external monitor) invalidates the whole buffer. We track it here and
+   *  re-upload from `resize()` when it flips. */
+  private lastUploadDpr = 0;
 
   constructor(canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl2", { antialias: false, alpha: false });
@@ -168,6 +174,7 @@ export class TimelineRenderer {
       }
     }
     this.instanceCount = total;
+    this.lastUploadDpr = dpr;
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuf);
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
@@ -185,6 +192,13 @@ export class TimelineRenderer {
       canvas.height = ph;
     }
     gl.viewport(0, 0, pw, ph);
+    // DPR flipped (external monitor hot-swap / zoom). The activity buffer
+    // has `yTopDevicePx` baked in, so re-upload from the cached batches.
+    // If we skip this, bars shift vertically and miss their lanes until
+    // the next setActivity() call.
+    if (this.lastUploadDpr !== 0 && Math.abs(this.lastUploadDpr - dpr) > 1e-3 && this.currentBatches.length > 0) {
+      this.setActivity(this.currentBatches);
+    }
   }
 
   render(viewport: Viewport) {
