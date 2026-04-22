@@ -85,6 +85,26 @@ impl OffsetHandle {
     pub fn set(&self, c: ClockOffset) {
         *self.inner.write() = c;
     }
+
+    /// Encode the current fit as the protobuf `ClockOffset` that gets
+    /// shipped in every batch. `gpu_id` is left at 0 — the agent fits once
+    /// per process today. Callers passing per-GPU fits should emit one
+    /// proto per GPU instead.
+    pub fn latest_proto(&self, node_id: u32) -> Option<perfweave_proto::v1::ClockOffset> {
+        let c = self.current();
+        // Identity fits carry no information; skip them to save bytes.
+        if c.offset_ns == 0 && c.slope_num == c.slope_den && c.residual_max_ns == 0 {
+            return None;
+        }
+        Some(perfweave_proto::v1::ClockOffset {
+            node_id,
+            gpu_id: 0,
+            offset_ns: c.offset_ns as u64,
+            slope_num: c.slope_num as u64,
+            slope_den: c.slope_den as u64,
+            residual_max_ns: c.residual_max_ns,
+        })
+    }
 }
 
 impl Default for OffsetHandle {
