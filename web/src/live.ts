@@ -24,6 +24,7 @@ export interface LiveSeriesKey {
 interface LiveFrameMsg {
   type: "metric";
   ts_ns: number;
+  server_now_ns?: number;
   gpus: {
     node_id: number;
     gpu_id: number;
@@ -59,6 +60,7 @@ interface LiveKernelMsgWire {
   gpu_id: number;
   correlation_id: number | string;
   name_id: number | string;
+  server_now_ns?: number;
 }
 
 export type LiveSeriesMap = Map<string, LiveMetricSample[]>;
@@ -92,6 +94,17 @@ export interface LiveStream {
   kernelsTick: number;
   /** Unbounded spike notifications for the side panel. */
   spikes: LiveSpikeMsg[];
+  /** Rolling estimate of (server_wall_clock - client_wall_clock) in ns.
+   *  Used by the Timeline to map "client performance.now" to server ns so
+   *  the live tape doesn't drift when the server runs on a remote host
+   *  with an independent RTC. NaN until first frame. */
+  skewNs: number;
+  /** Age of the newest live sample we've seen, in ms. Updated at each
+   *  frame; the UI surfaces this as a stale-data indicator in the HUD. */
+  lastSampleAgeMs: number;
+  /** Frames / kernels per second over the last window. Surfaced in HUD. */
+  metricRateHz: number;
+  kernelRateHz: number;
 }
 
 export function useLiveStream(enabled: boolean): LiveStream {
@@ -106,10 +119,58 @@ export function useLiveStream(enabled: boolean): LiveStream {
   // re-renders.
   const kernelsPendingRef = useRef(false);
 
+  // Skew estimator: EMA of (server_now_ns - client_now_ns). One-way only,
+  // so it absorbs transport latency into the estimate — good enough for
+  // tape alignment (tens of ms granularity) since both clocks are NTP-disciplined
+  // most of the time. Frame-internal ordering uses the server ts directly.
+  const skewRef = useRef<number>(NaN);
+  const [skewNs, setSkewNs] = useState<number>(NaN);
+  const skewEmitPendingRef = useRef(false);
+
+  // Rolling sample-rate counters. We update the state at ~2 Hz to avoid
+  // thrashing React; exact rate is computed over a ~1s window via
+  // timestamps-of-last-N-frames.
+  const metricTimesRef = useRef<number[]>([]);
+  const kernelTimesRef = useRef<number[]>([]);
+  const [metricRateHz, setMetricRateHz] = useState(0);
+  const [kernelRateHz, setKernelRateHz] = useState(0);
+  const [lastSampleAgeMs, setLastSampleAgeMs] = useState(Number.POSITIVE_INFINITY);
+
   useEffect(() => {
     if (!enabled) return;
     const esMetric = new EventSource("/api/live");
     const esKernel = new EventSource("/api/live/kernels");
+
+    const updateSkew = (serverNowNs: number | undefined) => {
+      if (!serverNowNs) return;
+      const clientNowNs = Date.now() * 1e6 + (performance.now() % 1) * 1e6;
+      const observed = serverNowNs - clientNowNs;
+      // Heavy EMA on purpose — individual frames sit atop 200-500ms of SSE
+      // variance; we only care about slow clock drift between hosts.
+      const prev = skewRef.current;
+      const next = Number.isFinite(prev) ? prev * 0.9 + observed * 0.1 : observed;
+      skewRef.current = next;
+      // Push to React state at most ~1 Hz.
+      if (!skewEmitPendingRef.current) {
+        skewEmitPendingRef.current = true;
+        setTimeout(() => {
+          skewEmitPendingRef.current = false;
+          setSkewNs(skewRef.current);
+        }, 1000);
+      }
+    };
+
+    const bumpRate = (arr: number[], setter: (n: number) => void) => {
+      const now = performance.now();
+      arr.push(now);
+      // Keep only the last ~2s of timestamps.
+      while (arr.length > 0 && now - arr[0] > 2000) arr.shift();
+      // Rate = samples / window_seconds, clamped at minimum 0.5s window
+      // so a single sample doesn't read infinity.
+      const window = Math.max(500, now - (arr[0] ?? now));
+      const rate = (arr.length * 1000) / window;
+      setter(rate);
+    };
 
     esMetric.addEventListener("metric", (ev) => {
       try {
@@ -124,12 +185,13 @@ export function useLiveStream(enabled: boolean): LiveStream {
               ring.set(k, arr);
             }
             arr.push({ tsNs: msg.ts_ns, value: m.latest });
-            // Trim leading samples; the render path is simpler with plain
-            // arrays than with a circular buffer.
             if (arr.length > RING_SIZE) arr.splice(0, arr.length - RING_SIZE);
           }
         }
         setLastTsNs(BigInt(msg.ts_ns));
+        setLastSampleAgeMs(0);
+        updateSkew(msg.server_now_ns);
+        bumpRate(metricTimesRef.current, setMetricRateHz);
         setConnected(true);
       } catch (e) {
         console.warn("bad live metric frame", e);
@@ -163,6 +225,8 @@ export function useLiveStream(enabled: boolean): LiveStream {
         if (ring.length > KERNEL_RING_SIZE) {
           ring.splice(0, ring.length - KERNEL_RING_SIZE);
         }
+        updateSkew(msg.server_now_ns);
+        bumpRate(kernelTimesRef.current, setKernelRateHz);
         if (!kernelsPendingRef.current) {
           kernelsPendingRef.current = true;
           setTimeout(() => {
@@ -179,9 +243,22 @@ export function useLiveStream(enabled: boolean): LiveStream {
     esMetric.onerror = onError;
     esKernel.onerror = onError;
 
+    // Tick stale age every 500ms from a single interval; this is the only
+    // place we expose "how long since last sample" to the UI.
+    const staleTimer = setInterval(() => {
+      const arr = metricTimesRef.current;
+      const last = arr[arr.length - 1];
+      if (last === undefined) {
+        setLastSampleAgeMs(Number.POSITIVE_INFINITY);
+      } else {
+        setLastSampleAgeMs(performance.now() - last);
+      }
+    }, 500);
+
     return () => {
       esMetric.close();
       esKernel.close();
+      clearInterval(staleTimer);
       setConnected(false);
     };
   }, [enabled]);
@@ -193,5 +270,9 @@ export function useLiveStream(enabled: boolean): LiveStream {
     kernels: kernelsRef.current,
     kernelsTick,
     spikes: spikesRef.current,
+    skewNs,
+    lastSampleAgeMs,
+    metricRateHz,
+    kernelRateHz,
   };
 }
