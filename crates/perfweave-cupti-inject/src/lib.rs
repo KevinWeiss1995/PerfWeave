@@ -59,17 +59,26 @@ pub use activity::ActivityBuffer;
 #[no_mangle]
 pub extern "C" fn InitializeInjection() -> i32 {
     perfweave_common::logging::init("cupti-inject");
+    // `connect()` already retries with backoff for up to 10s. If it still
+    // fails, we keep the injector installed (return 0 = success) so the
+    // target CUDA process does not die: ship() will attempt its own
+    // reconnect per batch and we'd rather observe a late-started agent
+    // than refuse to run the user's workload.
     match transport::connect() {
         Ok(conn) => {
             GLOBAL.lock().replace(Injector { transport: conn });
             tracing::info!("perfweave CUPTI injector initialized");
-            0
         }
         Err(e) => {
-            tracing::error!(error=%e, "cupti injector failed to connect to agent");
-            1
+            tracing::warn!(
+                error=%e,
+                "cupti injector could not reach agent within init budget; \
+                 will retry on each batch. Kernels may be lost until the agent \
+                 is up. Run `perfweave doctor` to diagnose."
+            );
         }
     }
+    0
 }
 
 struct Injector {
@@ -92,7 +101,23 @@ static GLOBAL: Mutex<Option<Injector>> = Mutex::new(None);
 #[allow(dead_code)]
 pub(crate) fn ship(batch: Batch) {
     let mut guard = GLOBAL.lock();
-    let Some(injector) = guard.as_mut() else { return };
+    if guard.is_none() {
+        // Init couldn't reach the agent within the init budget. Try once
+        // more cheaply here so a late-started agent still gets every
+        // subsequent batch. If it still fails we drop *this* batch only
+        // and try again next time.
+        match transport::reconnect(std::time::Duration::from_millis(200)) {
+            Ok(conn) => {
+                *guard = Some(Injector { transport: conn });
+                tracing::info!("perfweave CUPTI injector connected to agent");
+            }
+            Err(_) => {
+                DROPPED_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+    let injector = guard.as_mut().expect("just set above");
     let mut buf = Vec::with_capacity(batch.encoded_len() + 4);
     let len = batch.encoded_len() as u32;
     buf.extend_from_slice(&len.to_le_bytes());
@@ -100,10 +125,32 @@ pub(crate) fn ship(batch: Batch) {
         tracing::warn!(error=%e, "encode batch failed");
         return;
     }
-    if let Err(e) = injector.transport.stream.write_all(&buf) {
-        tracing::warn!(error=%e, "CUPTI ship failed; dropping batch");
+    if injector.transport.stream.write_all(&buf).is_ok() {
+        return;
+    }
+    // Write failed → agent likely restarted. Try a single short reconnect
+    // and retry the write. If reconnect fails too, drop the batch but
+    // surface a counter so the UI can flag live-stream drops rather than
+    // silently losing kernels.
+    DROPPED_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match transport::reconnect(std::time::Duration::from_millis(500)) {
+        Ok(conn) => {
+            injector.transport = conn;
+            if let Err(e) = injector.transport.stream.write_all(&buf) {
+                tracing::warn!(error=%e, "CUPTI ship failed after reconnect");
+            } else {
+                tracing::info!("CUPTI ship reconnected to agent");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error=%e, "CUPTI agent unreachable; dropping batch");
+        }
     }
 }
+
+/// Exposed so the agent (and, eventually, the UI) can surface drops.
+pub static DROPPED_BATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 // Placeholder to make the cdylib non-empty on build hosts without CUPTI.
 // The agent side handles absence gracefully (empty Unix socket).
