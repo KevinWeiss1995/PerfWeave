@@ -167,6 +167,8 @@ impl Collector for CollectorSvc {
                                     gpu_id: e.gpu_id,
                                     correlation_id: e.correlation_id,
                                     name_id: e.name_id,
+                                    server_now_ns:
+                                        perfweave_common::clock::host_realtime_ns(),
                                 });
                             }
                             persisted.push(e);
