@@ -1,6 +1,6 @@
 //! HTTP router + top-level `run()` that wires up the whole server:
-//!  - ingest (gRPC) on 7700
-//!  - HTTP/GraphQL/Arrow-IPC/SSE on 7777 (default)
+//!  - ingest (gRPC) on `perfweave_common::ports::COLLECTOR_GRPC` (7778)
+//!  - HTTP/GraphQL/Arrow-IPC/SSE on `ports::API_HTTP` (7777, default)
 //!  - FastRing publisher task
 //!  - SSE metric ticker
 //!  - In-process spike detector
@@ -140,9 +140,9 @@ fn uuid_like() -> String {
 }
 
 pub struct AppConfig {
-    /// HTTP/GraphQL/SSE listen address. Default 0.0.0.0:7777.
+    /// HTTP/GraphQL/SSE listen address. Default `ports::API_HTTP`.
     pub http_listen: String,
-    /// gRPC ingest listen address. Default 0.0.0.0:7700.
+    /// gRPC ingest listen address. Default `ports::COLLECTOR_GRPC`.
     pub grpc_listen: String,
     /// Optional web bundle dir to serve as static assets.
     pub web_dir: Option<std::path::PathBuf>,
@@ -152,9 +152,10 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
+        use perfweave_common::ports;
         Self {
-            http_listen: "0.0.0.0:7777".into(),
-            grpc_listen: "0.0.0.0:7700".into(),
+            http_listen: format!("0.0.0.0:{}", ports::API_HTTP),
+            grpc_listen: format!("0.0.0.0:{}", ports::COLLECTOR_GRPC),
             web_dir: None,
             ch: None,
         }
