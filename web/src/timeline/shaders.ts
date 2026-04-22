@@ -12,13 +12,13 @@ layout(location = 0) in vec2 a_corner;
 
 // Per-instance
 layout(location = 1) in vec2 a_range_ns;     // (start_ns, width_ns) packed as floats (64-bit ns → f32 via baseline subtraction)
-layout(location = 2) in float a_lane;         // lane index (per GPU × category)
+layout(location = 2) in float a_y_top_px;    // yTop of this instance's lane in device pixels
 layout(location = 3) in float a_color_id;
 layout(location = 4) in float a_corr_lo;      // low 32 bits of correlation_id as float (for highlight compare)
 
 // Uniforms
 uniform vec2 u_view_range_ns;   // start_ns - baseline, end_ns - baseline, as f32
-uniform float u_lane_height_px;
+uniform float u_lane_height_px; // height of *this class* of lane in device pixels
 uniform vec2 u_viewport_px;
 uniform float u_highlight_corr_lo;
 
@@ -43,7 +43,7 @@ void main() {
   float x_norm = (x_ns - u_view_range_ns.x) / range;      // 0..1 in viewport
   float x_clip = x_norm * 2.0 - 1.0;
 
-  float y_top_px = a_lane * u_lane_height_px;
+  float y_top_px = a_y_top_px;
   float y_px = y_top_px + a_corner.y * (u_lane_height_px - 2.0);
   float y_norm = y_px / u_viewport_px.y;
   float y_clip = 1.0 - y_norm * 2.0;                      // top-origin
