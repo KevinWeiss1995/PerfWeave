@@ -1,13 +1,16 @@
 //! NVML sampler. Reads utilization, memory, power, clocks, and throttle
 //! reasons at `metric_hz` Hz. NVML is the always-on baseline; overhead is
-//! negligible (well under 0.1% CPU at 100 Hz).
+//! negligible (well under 0.1% CPU at 1 Hz, which is our default).
 //!
-//! All values are emitted as `Category::METRIC` events with host realtime
-//! timestamps. NVML returns its samples on host realtime already, so there
-//! is no clock correction — the agent's ClockOffset for NVML is IDENTITY.
+//! Emits one `MetricFrame` per (gpu, tick) carrying every metric for that
+//! GPU at that timestamp. This is *much* cheaper on the gRPC path than the
+//! old "one Event per metric per tick" pattern (11 events per gpu per tick
+//! collapsed into 1 frame with 11 points).
 //!
-//! This module is only compiled with `--features nvml`; otherwise the binary
-//! has no CUDA runtime dependency.
+//! Timestamps are host realtime (NVML samples are already wall-clock), so
+//! there is no clock correction needed on the server for these frames.
+//!
+//! This module is only compiled with `--features nvml`.
 
 use super::Sampler;
 use crate::ring::EventRing;
@@ -15,7 +18,7 @@ use async_trait::async_trait;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use nvml_wrapper::{Device, Nvml};
 use perfweave_common::intern::hash as intern_hash;
-use perfweave_proto::v1::{event::Payload, Category, Event, MetricSample};
+use perfweave_proto::v1::{MetricFrame, MetricPoint};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,23 +49,13 @@ impl Sampler for NvmlSampler {
                 return;
             }
         };
-        tracing::info!(device_count, "NVML sampler online");
+        tracing::info!(device_count, hz = self.metric_hz, "NVML sampler online");
 
         let period = Duration::from_millis((1000 / self.metric_hz.max(1)) as u64);
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        let util_id = intern_hash("gpu.util.percent");
-        let mem_util_id = intern_hash("gpu.mem.util.percent");
-        let mem_used_id = intern_hash("gpu.mem.used.bytes");
-        let mem_free_id = intern_hash("gpu.mem.free.bytes");
-        let power_id = intern_hash("gpu.power.watts");
-        let power_limit_id = intern_hash("gpu.power.limit.watts");
-        let sm_clock_id = intern_hash("gpu.sm.clock.hz");
-        let mem_clock_id = intern_hash("gpu.mem.clock.hz");
-        let temp_id = intern_hash("gpu.temp.celsius");
-        let fan_id = intern_hash("gpu.fan.percent");
-        let throttle_id = intern_hash("gpu.throttle.reasons.bitmask");
+        let ids = MetricIds::new();
 
         loop {
             tokio::select! {
@@ -77,10 +70,8 @@ impl Sampler for NvmlSampler {
                                 continue;
                             }
                         };
-                        sample_device(&dev, now_ns, idx, self.node_id, &ring,
-                            util_id, mem_util_id, mem_used_id, mem_free_id, power_id,
-                            power_limit_id, sm_clock_id, mem_clock_id, temp_id, fan_id,
-                            throttle_id);
+                        let frame = build_frame(&dev, now_ns, idx, self.node_id, &ids);
+                        ring.push_frame(frame);
                     }
                 }
             }
@@ -89,69 +80,77 @@ impl Sampler for NvmlSampler {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn sample_device(
+struct MetricIds {
+    util: u64,
+    mem_util: u64,
+    mem_used: u64,
+    mem_free: u64,
+    power: u64,
+    power_limit: u64,
+    sm_clock: u64,
+    mem_clock: u64,
+    temp: u64,
+    fan: u64,
+    throttle: u64,
+}
+
+impl MetricIds {
+    fn new() -> Self {
+        Self {
+            util: intern_hash("gpu.util.percent"),
+            mem_util: intern_hash("gpu.mem.util.percent"),
+            mem_used: intern_hash("gpu.mem.used.bytes"),
+            mem_free: intern_hash("gpu.mem.free.bytes"),
+            power: intern_hash("gpu.power.watts"),
+            power_limit: intern_hash("gpu.power.limit.watts"),
+            sm_clock: intern_hash("gpu.sm.clock.hz"),
+            mem_clock: intern_hash("gpu.mem.clock.hz"),
+            temp: intern_hash("gpu.temp.celsius"),
+            fan: intern_hash("gpu.fan.percent"),
+            throttle: intern_hash("gpu.throttle.reasons.bitmask"),
+        }
+    }
+}
+
+fn build_frame(
     dev: &Device<'_>,
     now_ns: u64,
     gpu_id: u32,
     node_id: u32,
-    ring: &EventRing,
-    util_id: u64,
-    mem_util_id: u64,
-    mem_used_id: u64,
-    mem_free_id: u64,
-    power_id: u64,
-    power_limit_id: u64,
-    sm_clock_id: u64,
-    mem_clock_id: u64,
-    temp_id: u64,
-    fan_id: u64,
-    throttle_id: u64,
-) {
-    let emit = |metric_id: u64, value: f64, unit: &str| {
-        ring.push(Event {
-            ts_ns: now_ns,
-            duration_ns: 0,
-            node_id,
-            gpu_id,
-            pid: 0, tid: 0, ctx_id: 0, stream_id: 0,
-            category: Category::Metric as i32,
-            name_id: metric_id,
-            correlation_id: 0,
-            parent_id: 0,
-            payload: Some(Payload::Metric(MetricSample {
-                metric_id, value, unit: unit.to_string(),
-            })),
-        });
-    };
+    ids: &MetricIds,
+) -> MetricFrame {
+    let mut points: Vec<MetricPoint> = Vec::with_capacity(11);
+    let mut push = |metric_id: u64, v: f64| points.push(MetricPoint { metric_id, value: v });
 
     if let Ok(u) = dev.utilization_rates() {
-        emit(util_id, u.gpu as f64, "percent");
-        emit(mem_util_id, u.memory as f64, "percent");
+        push(ids.util, u.gpu as f64);
+        push(ids.mem_util, u.memory as f64);
     }
     if let Ok(m) = dev.memory_info() {
-        emit(mem_used_id, m.used as f64, "bytes");
-        emit(mem_free_id, m.free as f64, "bytes");
+        push(ids.mem_used, m.used as f64);
+        push(ids.mem_free, m.free as f64);
     }
     if let Ok(p) = dev.power_usage() {
-        emit(power_id, p as f64 / 1000.0, "watts");
+        push(ids.power, p as f64 / 1000.0);
     }
     if let Ok(p) = dev.enforced_power_limit() {
-        emit(power_limit_id, p as f64 / 1000.0, "watts");
+        push(ids.power_limit, p as f64 / 1000.0);
     }
     if let Ok(c) = dev.clock_info(Clock::SM) {
-        emit(sm_clock_id, c as f64 * 1.0e6, "hz");
+        push(ids.sm_clock, c as f64 * 1.0e6);
     }
     if let Ok(c) = dev.clock_info(Clock::Memory) {
-        emit(mem_clock_id, c as f64 * 1.0e6, "hz");
+        push(ids.mem_clock, c as f64 * 1.0e6);
     }
     if let Ok(t) = dev.temperature(TemperatureSensor::Gpu) {
-        emit(temp_id, t as f64, "celsius");
+        push(ids.temp, t as f64);
     }
     if let Ok(f) = dev.fan_speed(0) {
-        emit(fan_id, f as f64, "percent");
+        push(ids.fan, f as f64);
     }
     if let Ok(reasons) = dev.current_throttle_reasons() {
-        emit(throttle_id, reasons.bits() as f64, "bitmask");
+        push(ids.throttle, reasons.bits() as f64);
     }
+
+    MetricFrame { node_id, gpu_id, ts_ns: now_ns, points }
 }
