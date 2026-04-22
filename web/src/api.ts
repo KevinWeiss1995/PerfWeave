@@ -4,6 +4,65 @@
 
 import { tableFromIPC, Table } from "apache-arrow";
 
+// --- Types returned by the server -------------------------------------------
+// UInt64 fields cross the wire as strings (GraphQL scalar) and are parsed
+// with BigInt() at the call site. Percent/ratio fields come back as f32/f64.
+
+export type Bottleneck =
+  | "MEMORY_BOUND"
+  | "COMPUTE_BOUND"
+  | "LATENCY_BOUND"
+  | "BALANCED"
+  | "UNCLASSIFIED";
+
+export type KernelBound = "Memory" | "Compute" | "Latency" | "Balanced";
+export type KernelConfidence = "High" | "Medium" | "Low";
+
+export interface KernelSol {
+  smActivePct: number;
+  achievedOccupancyPct: number;
+  dramBwPct: number;
+  l1BwPct: number;
+  l2BwPct: number;
+  instThroughputPct: number;
+  arithmeticIntensity: number;
+  achievedGflops: number;
+  bound: KernelBound;
+  confidence: KernelConfidence;
+  source: string;
+}
+
+export interface KernelInWindow {
+  correlationId: string;
+  nameId: string;
+  name: string;
+  tsNs: string;
+  durationNs: string;
+  gpuId: number;
+  sol: KernelSol | null;
+}
+
+export interface TopKernelRow {
+  nameId: string;
+  name: string;
+  totalDurationNs: string;
+  launches: string;
+  meanDurationNs: string;
+}
+
+export interface SpikeContext {
+  bucketStartNs: string;
+  bucketWidthNs: string;
+  gpuId: number;
+  metricId: string;
+  metricName: string;
+  bottleneck: Bottleneck;
+  avgMemUtil: number;
+  avgGpuUtil: number;
+  topKernels: TopKernelRow[];
+  kernelsInWindow: KernelInWindow[];
+}
+
 export interface TimelineFetch {
   startNs: bigint;
   endNs: bigint;
