@@ -35,6 +35,7 @@ export interface Measurement {
 export interface SpikeMarker {
   bucketStartNs: bigint;
   bucketWidthNs: bigint;
+  nodeId: number;
   gpuId: number;
   metricId: bigint;
   zMad: number;
@@ -85,6 +86,7 @@ export function SidePanel({
         const markers: SpikeMarker[] = spikes.map((sp) => ({
           bucketStartNs: BigInt(sp.bucketStartNs),
           bucketWidthNs: BigInt(sp.bucketWidthNs),
+          nodeId: sp.nodeId,
           gpuId: sp.gpuId,
           metricId: BigInt(sp.metricId),
           zMad: sp.zMad,
