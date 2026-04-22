@@ -1,12 +1,12 @@
 [package]
-name = "perfweave-api"
+name = "perfweave-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "perfweave-api"
+name = "perfweave-server"
 path = "src/main.rs"
 
 [lib]
@@ -14,9 +14,13 @@ path = "src/lib.rs"
 
 [dependencies]
 perfweave-common = { path = "../perfweave-common" }
-perfweave-proto = { path = "../perfweave-proto" }
+perfweave-proto  = { path = "../perfweave-proto" }
 
 tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+tonic.workspace = true
+prost.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
@@ -33,5 +37,6 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
-futures.workspace = true
+parking_lot.workspace = true
 ahash.workspace = true
+arc-swap = "1.7"
