@@ -1,73 +1,20 @@
-//! Background import of `.nsys-rep` / `.ncu-rep` files and spike recomputation.
+//! Background import of `.nsys-rep` files.
 //!
 //! The nsys import path shells out to `nsys export --type sqlite <file>` and
-//! ingests rows into the canonical `events` schema. This is the only place in
-//! the system that uses the nsys CLI, and it is offline-only.
+//! ingests rows into the canonical `events` schema. This is the only place
+//! in the system that uses the nsys CLI, and it is offline-only.
 //!
-//! Spike recomputation is a pure SQL job that runs on a 10s timer in
-//! production and is also exposed as a GraphQL mutation for tests.
+//! Spike recomputation is gone. After the two-plane rework spikes are
+//! detected live by `crate::spike_detect` from the FastRing and persisted
+//! to the `spikes` table at detection time. There is no periodic "scan
+//! the last 15 minutes" job anymore — that job was the #1 source of
+//! ClickHouse CPU churn.
 
-use crate::ch::Ch;
+use crate::store::Ch;
 use anyhow::{Context, Result};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-
-/// Write into `spikes` the 262ms-bucket metric observations whose value
-/// deviates more than 3.5 MAD from the rolling 30-bucket median.
-/// Returns the number of rows inserted (may be 0 if nothing deviated).
-pub async fn recompute_spikes_window(ch: &Ch, start_ns: u64, end_ns: u64) -> Result<u64> {
-    let sql = format!(
-        r#"
-        INSERT INTO spikes
-        SELECT
-            bucket_start_ns,
-            bucket_width_ns,
-            node_id,
-            gpu_id,
-            metric_id,
-            p99 AS value,
-            quantileExact(0.5)(p99) OVER w AS median,
-            median(abs(p99 - quantileExact(0.5)(p99) OVER w)) OVER w AS mad,
-            if(mad > 0, abs(p99 - median) / mad, 0.0) AS z_mad
-        FROM (
-            SELECT
-                bucket_start_ns,
-                bucket_width_ns,
-                node_id,
-                gpu_id,
-                metric_id,
-                quantileTDigestMerge(0.99)(p99_value) AS p99
-            FROM tiles_metric
-            WHERE bucket_width_ns = 262144000
-              AND bucket_start_ns >= {start_ns}
-              AND bucket_start_ns <  {end_ns}
-            GROUP BY bucket_start_ns, bucket_width_ns, node_id, gpu_id, metric_id
-        )
-        WINDOW w AS (
-            PARTITION BY node_id, gpu_id, metric_id
-            ORDER BY bucket_start_ns
-            ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-        )
-        "#
-    );
-    let before = count_spikes(ch, start_ns, end_ns).await.unwrap_or(0);
-    ch.client.query(&sql).execute().await.context("recompute_spikes insert failed")?;
-    let after = count_spikes(ch, start_ns, end_ns).await.unwrap_or(0);
-    Ok(after.saturating_sub(before))
-}
-
-async fn count_spikes(ch: &Ch, start_ns: u64, end_ns: u64) -> Result<u64> {
-    #[derive(Row, Deserialize)]
-    struct C { c: u64 }
-    let sql = format!("SELECT count() AS c FROM spikes WHERE bucket_start_ns >= {start_ns} AND bucket_start_ns < {end_ns} AND z_mad >= 3.5");
-    let c: C = ch.client.query(&sql).fetch_one().await?;
-    Ok(c.c)
-}
-
-// --------------------------------------------------------------------------
-// Nsight Systems import
-// --------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
 pub struct ImportResult {
@@ -98,13 +45,6 @@ pub async fn import_nsys(ch: &Ch, path: &Path, node_id: u32) -> Result<ImportRes
     if !status.success() {
         anyhow::bail!("`nsys export` exited with {status}. Is the file a valid .nsys-rep?");
     }
-
-    // ClickHouse can read the SQLite file via the `sqlite` table function
-    // when the file is accessible to the server. For a local single-box
-    // setup we share /tmp; in Docker we bind-mount. If ClickHouse cannot
-    // see the file we fall back to a Rust-side SQLite reader (not included
-    // in MVP — it's <100 LOC using the `rusqlite` crate and we add it if
-    // containerized deployments need it).
 
     let nsys_sql = format!(
         r#"
