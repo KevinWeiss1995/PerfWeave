@@ -123,7 +123,7 @@ export function App() {
         viewport={viewport}
         onViewportChange={onViewportChange}
         spikes={spikes}
-        onSpikeClick={setFocusedSpike}
+        onSpikeClick={onSpikeClick}
         liveSeries={live ? liveStream.series : null}
       />
       <SidePanel
@@ -134,6 +134,12 @@ export function App() {
         onSpikesChanged={setSpikes}
         focusedSpike={focusedSpike}
       />
+      {drilldownSpike && (
+        <SpikeDrilldown
+          spike={drilldownSpike}
+          onClose={() => setDrilldownSpike(null)}
+        />
+      )}
     </div>
   );
 }
