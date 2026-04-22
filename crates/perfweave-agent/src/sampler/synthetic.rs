@@ -2,13 +2,19 @@
 //! activity so the UI + API can be developed and load-tested on machines
 //! without an NVIDIA GPU. NOT a mock of NVML/CUPTI — it writes the SAME
 //! canonical events, just with stochastic values.
+//!
+//! Rework notes (v2):
+//!   * Metrics flow as `MetricFrame`s (1 Hz by default), matching NVML.
+//!   * Kernel/API/Memcpy bursts are gated behind `burst` so the default
+//!     synthetic profile doesn't pin CPUs pretending to be a busy GPU.
+//!     CI regression and demo modes keep bursts enabled.
 
 use super::Sampler;
 use crate::ring::EventRing;
 use async_trait::async_trait;
 use perfweave_common::intern::hash as intern_hash;
 use perfweave_proto::v1::{
-    event::Payload, Category, Event, KernelDetail, MemcpyDetail, MetricSample,
+    event::Payload, Category, Event, KernelDetail, MemcpyDetail, MetricFrame, MetricPoint,
 };
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rand_distr::Distribution;
@@ -19,6 +25,10 @@ pub struct SyntheticSampler {
     pub metric_hz: u32,
     pub node_id: u32,
     pub seed: u64,
+    /// When true, emit kernel/API/memcpy bursts on every tick. When false
+    /// (the default after v2), only metric frames. Bursts are for demos
+    /// and load tests.
+    pub burst: bool,
 }
 
 #[async_trait]
@@ -34,7 +44,6 @@ impl Sampler for SyntheticSampler {
         ));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        // Kernel name pool — the hash is deterministic so the dictionary is stable.
         let kernel_names: Vec<(&str, u64)> = KERNEL_NAMES
             .iter()
             .map(|n| (*n, intern_hash(n)))
@@ -47,41 +56,38 @@ impl Sampler for SyntheticSampler {
 
         let mut next_corr: u64 = 1;
 
+        tracing::info!(
+            num_gpus = self.num_gpus,
+            hz = self.metric_hz,
+            burst = self.burst,
+            "synthetic sampler online"
+        );
+
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { break; }
-                }
+                _ = shutdown.changed() => if *shutdown.borrow() { break; },
                 _ = tick.tick() => {
                     let now_ns = perfweave_common::clock::host_realtime_ns();
                     for gpu in 0..self.num_gpus {
-                        // Metrics
+                        // One MetricFrame per (gpu, tick) — same path as NVML.
+                        let mut points = Vec::with_capacity(metric_names.len());
                         for (name, id) in &metric_names {
-                            let (value, unit) = synth_metric(name, &mut rng);
-                            ring.push(Event {
-                                ts_ns: now_ns,
-                                duration_ns: 0,
-                                node_id: self.node_id,
-                                gpu_id: gpu,
-                                pid: 0, tid: 0, ctx_id: 0, stream_id: 0,
-                                category: Category::Metric as i32,
-                                name_id: *id,
-                                correlation_id: 0,
-                                parent_id: 0,
-                                payload: Some(Payload::Metric(MetricSample {
-                                    metric_id: *id,
-                                    value,
-                                    unit: unit.to_string(),
-                                })),
-                            });
+                            let (value, _unit) = synth_metric(name, &mut rng);
+                            points.push(MetricPoint { metric_id: *id, value });
                         }
-                        // Burst of kernel + api + memcpy activity
+                        ring.push_frame(MetricFrame {
+                            node_id: self.node_id,
+                            gpu_id: gpu,
+                            ts_ns: now_ns,
+                            points,
+                        });
+
+                        if !self.burst { continue; }
+
                         let kernels_this_tick: u32 = rng.gen_range(4..32);
                         for _ in 0..kernels_this_tick {
-                            let (kname, kid) = kernel_names[rng.gen_range(0..kernel_names.len())];
-                            let _ = kname;
-                            let (aname, aid) = api_names[rng.gen_range(0..api_names.len())];
-                            let _ = aname;
+                            let (_, kid) = kernel_names[rng.gen_range(0..kernel_names.len())];
+                            let (_, aid) = api_names[rng.gen_range(0..api_names.len())];
                             let corr = next_corr;
                             next_corr += 1;
                             let api_start = now_ns + rng.gen_range(0..1_000_000);
@@ -116,7 +122,6 @@ impl Sampler for SyntheticSampler {
                                 })),
                             });
                         }
-                        // Memcpy
                         if rng.gen_bool(0.3) {
                             let bytes: u64 = rng.gen_range(4_096..16_777_216);
                             let dur = ((bytes as f64 / 12.0e9) * 1e9) as u64 + rng.gen_range(500..2000);
@@ -144,6 +149,7 @@ impl Sampler for SyntheticSampler {
 fn synth_metric(name: &str, rng: &mut SmallRng) -> (f64, &'static str) {
     match name {
         "gpu.util.percent" => (clamp(rng.gen_range(0.0..100.0) + sinewave(rng, 20.0), 0.0, 100.0), "percent"),
+        "gpu.mem.util.percent" => (clamp(rng.gen_range(0.0..100.0), 0.0, 100.0), "percent"),
         "gpu.mem.used.bytes" => ((rng.gen_range(8e9..20e9)) as f64, "bytes"),
         "gpu.power.watts" => (rng.gen_range(60.0..350.0), "watts"),
         "gpu.sm.clock.hz" => (rng.gen_range(1.0e9..1.9e9), "hz"),
@@ -153,7 +159,6 @@ fn synth_metric(name: &str, rng: &mut SmallRng) -> (f64, &'static str) {
 }
 
 fn sinewave(rng: &mut SmallRng, amplitude: f64) -> f64 {
-    // Injects a slow wave so the metric lane has visible structure in demos.
     let t = rng.gen::<f64>();
     (t * std::f64::consts::TAU).sin() * amplitude
 }
@@ -168,6 +173,7 @@ fn gamma_us(rng: &mut SmallRng, mean_us: f64, shape: f64) -> u64 {
 
 const METRIC_NAMES: &[&str] = &[
     "gpu.util.percent",
+    "gpu.mem.util.percent",
     "gpu.mem.used.bytes",
     "gpu.power.watts",
     "gpu.sm.clock.hz",
