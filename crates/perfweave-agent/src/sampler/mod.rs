@@ -9,7 +9,11 @@ pub mod nvml;
 #[cfg(feature = "dcgm")]
 pub mod dcgm;
 
-#[cfg(feature = "cupti")]
+/// CUPTI activity receiver: listens on a Unix socket and merges CUPTI
+/// events shipped by `libperfweave_cupti_inject.so` into the main ring.
+/// This module has no CUPTI dep itself (just tokio + protobuf), so it
+/// always compiles — the heavy CUPTI FFI lives in the inject crate.
+#[cfg(unix)]
 pub mod cupti;
 
 use crate::ring::EventRing;

@@ -132,7 +132,7 @@ fn build_real_samplers(_cfg: &AgentConfig) -> Vec<Box<dyn Sampler>> {
             metric_hz: _cfg.metric_hz,
         }));
     }
-    #[cfg(feature = "cupti")]
+    #[cfg(unix)]
     {
         let path = std::env::var("PERFWEAVE_CUPTI_SOCK")
             .unwrap_or_else(|_| "/tmp/perfweave.cupti.sock".to_string());
