@@ -106,42 +106,27 @@ async fn main() -> Result<()> {
 }
 
 async fn cmd_start(args: StartArgs) -> Result<()> {
-    use perfweave_collector::{clickhouse_sink::{Sink, SinkConfig}, migrations, server::CollectorSvc};
-    use std::sync::Arc;
-    use tonic::transport::Server;
+    use perfweave_server::{run, store::ch::ChConfig, AppConfig};
 
-    // 1. ClickHouse reachability + migrations
-    let ch = clickhouse::Client::default()
-        .with_url(&args.clickhouse_url);
-    migrations::apply(&ch).await
-        .with_context(|| format!(
-            "could not apply migrations against {}. Is ClickHouse running? Try:\n  docker run -d --name clickhouse-perfweave -p 8123:8123 -p 9000:9000 clickhouse/clickhouse-server:24.8",
-            args.clickhouse_url
-        ))?;
-
-    // 2. Collector
-    let sink = Sink::spawn(SinkConfig { url: args.clickhouse_url.clone(), ..Default::default() })?;
-    let svc = CollectorSvc::new(Arc::new(sink)).into_service();
-    let collector_addr = args.collector_listen.parse()?;
-    tokio::spawn(async move {
-        if let Err(e) = Server::builder().add_service(svc).serve(collector_addr).await {
-            tracing::error!(error=%e, "collector crashed");
-        }
-    });
-
-    // 3. API + UI
-    let api_cfg = perfweave_api::app::AppConfig {
-        listen: args.api_listen.clone(),
+    // Unified server: ingest (gRPC) + api (HTTP/GraphQL/SSE) + FastRing +
+    // spike detector in one process. No IPC hop for metrics.
+    let cfg = AppConfig {
+        http_listen: args.api_listen.clone(),
+        grpc_listen: args.collector_listen.clone(),
         web_dir: args.web_dir.clone(),
+        ch: Some(ChConfig {
+            url: args.clickhouse_url.clone(),
+            ..Default::default()
+        }),
     };
-    let api = tokio::spawn(async move {
-        if let Err(e) = perfweave_api::app::run(api_cfg).await {
-            tracing::error!(error=%e, "api crashed");
+    let server = tokio::spawn(async move {
+        if let Err(e) = run(cfg).await {
+            tracing::error!(error=%e, "perfweave-server crashed");
         }
     });
 
-    // 4. Local agent (the zero-config case). For multi-node deployments,
-    //    pass --no-local-agent and run `perfweave-agent` on every node.
+    // Local agent (the zero-config case). For multi-node deployments, pass
+    // --no-local-agent and run `perfweave-agent` on every node.
     if !args.no_local_agent {
         let collector_url = format!(
             "http://{}",
@@ -154,7 +139,7 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
         }));
     }
 
-    // 5. Open browser
+    // Open browser unless asked not to.
     if !args.no_open {
         let url = format!("http://{}/", args.api_listen.replace("0.0.0.0", "localhost"));
         if let Err(e) = open_browser(&url) {
@@ -162,7 +147,7 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
         }
     }
 
-    api.await?;
+    server.await?;
     Ok(())
 }
 
@@ -184,8 +169,9 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
 }
 
 async fn cmd_import(args: ImportArgs) -> Result<()> {
-    let ch = perfweave_api::ch::Ch::new(perfweave_api::ch::ChConfig::default());
-    let r = perfweave_api::imports::import_nsys(&ch, &args.path, args.node_id).await?;
+    use perfweave_server::store::ch::{Ch, ChConfig};
+    let ch = Ch::new(ChConfig::default());
+    let r = perfweave_server::api::imports::import_nsys(&ch, &args.path, args.node_id).await?;
     println!("imported {} events ({}ns .. {}ns)", r.event_count, r.ts_min_ns, r.ts_max_ns);
     Ok(())
 }
