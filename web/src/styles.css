@@ -124,14 +124,27 @@ html, body, #root {
   font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
 }
-.lane-label-sub {
+.lane-label-gpu {
   color: var(--fg-dim);
+  font: 10px/1.2 ui-monospace, monospace;
+  font-weight: 400;
+}
+.lane-label-values {
+  color: var(--fg);
   font: 10px/1.2 ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
   overflow: hidden;
   text-overflow: ellipsis;
+  display: flex;
+  gap: 4px;
 }
+.lane-label-value { color: var(--fg); }
+.lane-label-sep { color: #394049; }
 
 .timeline-main {
   grid-row: 1;
@@ -252,6 +265,68 @@ html, body, #root {
   border-radius: 3px;
   font: 11px/1.3 ui-monospace, monospace;
   pointer-events: none;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  white-space: nowrap;
+  max-width: calc(100% - 16px);
+}
+.hud-item { color: var(--fg-dim); }
+.hud-sep { color: #394049; }
+.hud-warn { color: #f7a93d; }
+.hud-pill {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  line-height: 1.3;
+}
+.hud-pill--live  { color: #0b1014; background: #39dd8a; }
+.hud-pill--stale { color: #1a1204; background: #f7a93d; }
+.hud-pill--down  { color: #fff;     background: #d14d4d; }
+
+/* Kernel hover tooltip. Follows the pointer over the kernels lane; shows
+   the resolved symbol name, duration, correlation id, and count of
+   sibling launches currently in the live ring. */
+.kernel-tooltip {
+  position: absolute;
+  z-index: 20;
+  pointer-events: none;
+  background: rgba(8, 12, 16, 0.96);
+  border: 1px solid #273038;
+  border-radius: 4px;
+  padding: 6px 8px;
+  min-width: 180px;
+  max-width: 340px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55);
+  color: var(--fg);
+  font: 11px/1.4 ui-monospace, "JetBrains Mono", monospace;
+}
+.kernel-tooltip__name {
+  color: #cfe9ff;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #1d232b;
+}
+.kernel-tooltip__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.kernel-tooltip__row .k { color: var(--fg-dim); }
+.kernel-tooltip__row .v { color: var(--fg); font-variant-numeric: tabular-nums; }
+.kernel-tooltip__hint {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px dotted #273038;
+  color: #6a7280;
+  font-size: 10px;
+  letter-spacing: 0.02em;
 }
 
 /* Spike pins: thin vertical lines with a triangle at the top that stand
