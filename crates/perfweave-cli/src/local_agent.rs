@@ -64,6 +64,24 @@ pub async fn run(opts: Opts) {
         tokio::spawn(async move { s.run(r, sh).await });
     }
 
+    // CUPTI receiver: listens on a Unix socket for the `perfweave run`
+    // injector (`libperfweave_cupti_inject.so`). Without this the injector
+    // connects, gets ECONNREFUSED, and silently drops every kernel — which
+    // is exactly the "perfweave run ./my_cuda prints output but the UI is
+    // empty" footgun. Safe to spawn even if no one ever connects.
+    #[cfg(unix)]
+    {
+        let path = std::env::var("PERFWEAVE_CUPTI_SOCK")
+            .unwrap_or_else(|_| "/tmp/perfweave.cupti.sock".to_string());
+        let _ = std::fs::remove_file(&path);
+        let cupti = Box::new(perfweave_agent::sampler::cupti::CuptiReceiver {
+            socket_path: std::path::PathBuf::from(path),
+        });
+        let r = ring.clone();
+        let sh = shutdown_rx.clone();
+        tokio::spawn(async move { cupti.run(r, sh).await });
+    }
+
     let _ = grpc_client::run(
         UploaderConfig {
             collector_url: opts.collector_url,
