@@ -26,6 +26,7 @@ message Event {
     MemcpyDetail memcpy  = 22;
     ApiCallDetail api    = 23;
     MarkerDetail marker  = 24;
+    KernelSol    sol     = 25;
   }
 }
 
@@ -39,6 +40,7 @@ enum Category {
   SYNC                 = 6;
   OVERHEAD             = 7;
   MARKER               = 8;
+  SOL                  = 9;
 }
 
 message MetricSample {
@@ -48,6 +50,26 @@ message MetricSample {
   // Unit is free-form but convention is SI: "percent", "bytes", "bytes_per_sec",
   // "watts", "celsius", "hz".
   string  unit      = 3;
+}
+
+// Aggregated metric frame. Agents fold their high-rate samplers (NVML at
+// 10Hz, tegrastats at 1Hz) into one frame per second per (node, gpu). This
+// drops the per-sample envelope overhead by ~10x vs emitting one Event per
+// metric reading.
+//
+// Emitted through the agent ring like any other event via Category::METRIC
+// with an empty payload; the collector splits these off into the FastRing
+// before they ever reach ClickHouse.
+message MetricFrame {
+  uint32 node_id = 1;
+  uint32 gpu_id  = 2;
+  fixed64 ts_ns  = 3;
+  repeated MetricPoint points = 4;
+}
+
+message MetricPoint {
+  fixed64 metric_id = 1;
+  double  value     = 2;
 }
 
 message KernelDetail {
@@ -91,6 +113,56 @@ message MarkerDetail {
   // NVTX domain string id (interned).
   fixed64 domain_id = 1;
   uint32  color_argb = 2;
+  // Interned message id (may differ from Event.name_id, which is the tag name).
+  fixed64 message_id = 3;
+}
+
+// Nsight-Compute-style "Speed of Light" report for a single kernel launch.
+// Populated by CUPTI PM sampling (low-rate host sampling) at steady state
+// and by CUPTI_PROFILER_REPLAY_KERNEL when the user clicks a spike.
+message KernelSol {
+  fixed64 correlation_id = 1;
+  // Normalized to 0..100 pct of SOL.
+  float sm_active_pct          = 2;
+  float achieved_occupancy_pct = 3;
+  float dram_bw_pct            = 4;
+  float l1_bw_pct              = 5;
+  float l2_bw_pct              = 6;
+  float inst_throughput_pct    = 7;
+  float theoretical_occupancy_pct = 8;
+  // flop/byte (0 if unknown).
+  float arithmetic_intensity   = 9;
+  float achieved_gflops        = 10;
+
+  enum Bound {
+    BOUND_UNKNOWN = 0;
+    MEMORY        = 1;
+    COMPUTE       = 2;
+    LATENCY       = 3;
+    BALANCED      = 4;
+  }
+  Bound bound = 11;
+
+  enum Confidence {
+    CONF_UNKNOWN = 0;
+    LOW          = 1; // few PM samples overlapped this kernel; numbers are noisy
+    HIGH         = 2; // replay-profiled, exact counters
+  }
+  Confidence confidence = 12;
+
+  enum Source {
+    SRC_UNKNOWN   = 0;
+    HOST_SAMPLING = 1;
+    REPLAY        = 2;
+  }
+  Source source = 13;
+
+  repeated StallCount stalls = 14; // top-5 by count
+}
+
+message StallCount {
+  uint32 reason_id = 1;
+  uint32 count     = 2;
 }
 
 // Intern a string at the collector once; agents send (id, text) the first
@@ -118,12 +190,30 @@ message AgentHello {
   string hostname = 2;
   string agent_version = 3;
   uint32 num_gpus = 4;
+  // Device peak throughput per GPU (0 = unknown). Used to draw roofline.
+  repeated DevicePeak device_peaks = 5;
+  // Listen address where this agent accepts ProfileKernels RPCs back from
+  // the server (empty = agent does not support on-demand replay profiling).
+  string agent_rpc_addr = 6;
+}
+
+message DevicePeak {
+  uint32 gpu_id            = 1;
+  // Peak FP32 GFLOPS; computed from compute-capability * #SMs * clock.
+  float  peak_fp32_gflops  = 2;
+  // Peak device memory bandwidth in GB/s.
+  float  peak_dram_gb_s    = 3;
+  string device_name       = 4;
+  string compute_capability = 5; // e.g. "8.7" for Orin
 }
 
 message Batch {
   repeated Event          events = 1;
   repeated StringIntern   strings = 2;
   repeated ClockOffset    offsets = 3;
+  // Aggregated metric frames. Emitted at 1Hz by each sampler instead of N
+  // per-sample Events. Splits from `events` on the server before CH.
+  repeated MetricFrame    metric_frames = 4;
 }
 
 message Ack {
@@ -143,4 +233,29 @@ service Collector {
 message RegisterAck {
   uint32 assigned_node_id = 1;
   uint64 server_epoch_ns  = 2;
+}
+
+// ---------------------------------------------------------------------------
+// On-demand replay profiling. The server calls this back to the agent that
+// owns the target process; the agent uses CUPTI_PROFILER_REPLAY_KERNEL to
+// collect exact counters for the requested kernels on their next launches.
+// ---------------------------------------------------------------------------
+
+service PerfweaveAgent {
+  rpc ProfileKernels(ProfileRequest) returns (stream KernelSol);
+}
+
+message ProfileRequest {
+  uint32 gpu_id            = 1;
+  fixed64 window_start_ns  = 2;
+  fixed64 window_end_ns    = 3;
+  // Up to 8 correlation_ids to re-profile. The agent replays the next
+  // N launches of each matching kernel.
+  repeated fixed64 correlation_ids = 4;
+  // Optional: kernel name_ids (xxh3) to re-profile (matches any launch
+  // whose name hashes to one of these). More robust than correlation_ids
+  // when the spike window has already scrolled past.
+  repeated fixed64 name_ids = 5;
+  // Soft timeout in ms. Agent gives up after this and closes the stream.
+  uint32 timeout_ms = 6;
 }
