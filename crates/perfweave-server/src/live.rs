@@ -28,6 +28,11 @@ pub struct LiveKernelEvent {
     pub gpu_id: u32,
     pub correlation_id: u64,
     pub name_id: u64,
+    /// Wall-clock on the server at the moment the frame is sent. Lets the
+    /// UI compute client-server skew and keep the "now" edge aligned when
+    /// the server lives on a remote host with an independent RTC (Jetson
+    /// over SSH tunnel, for example).
+    pub server_now_ns: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -40,6 +45,10 @@ pub enum LiveFrame {
 #[derive(Clone, Debug, Serialize)]
 pub struct MetricFrame {
     pub ts_ns: u64,
+    /// Server wall-clock at emit time (distinct from `ts_ns`, which is the
+    /// publish time of the FastRing snapshot). Used by the UI for skew
+    /// compensation across hosts.
+    pub server_now_ns: u64,
     pub gpus: Vec<GpuFrame>,
 }
 
@@ -140,6 +149,7 @@ fn build_metric_frame(ring: &FastRing) -> MetricFrame {
     gpus.sort_by_key(|g| (g.node_id, g.gpu_id));
     MetricFrame {
         ts_ns: snap.published_at_ns,
+        server_now_ns: perfweave_common::clock::host_realtime_ns(),
         gpus,
     }
 }
