@@ -148,17 +148,21 @@ export class TimelineRenderer {
   setActivity(batches: InstanceBatch[]) {
     this.currentBatches = batches;
     // Concatenate all batches into one instance buffer. Each instance is 5
-    // floats = 20 bytes.
+    // floats = 20 bytes. The "lane" slot carries the pre-multiplied
+    // yTopPx (in *device* pixels) so the shader can handle mixed lane
+    // heights (metric lanes are tall, activity lanes are short).
     let total = 0;
     for (const b of batches) total += b.starts.length;
     const data = new Float32Array(total * 5);
     let o = 0;
     const baselineF = Number(this.baselineNs);
+    const dpr = this.dpr();
     for (const b of batches) {
+      const yTopDevicePx = laneTopPx(this.lanes, b.lane) * dpr;
       for (let i = 0; i < b.starts.length; i++) {
         data[o++] = (b.starts[i] - baselineF);
         data[o++] = b.widths[i];
-        data[o++] = b.lane;
+        data[o++] = yTopDevicePx;
         data[o++] = b.colorId;
         data[o++] = b.corrLo[i];
       }
