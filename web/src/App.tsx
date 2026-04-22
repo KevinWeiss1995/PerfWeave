@@ -30,9 +30,14 @@ export function App() {
 
   const [selection, setSelection] = useState<Selection | null>(null);
   const [measurement, setMeasurement] = useState<Measurement | null>(null);
+  // In Live mode the Timeline owns a RAF-driven virtual clock so the tape
+  // scrolls smoothly between 1 Hz samples. We only seed the viewport width
+  // here; the actual start/end used for rendering is derived inside Timeline
+  // from that virtual clock. When the user pans/zooms, onViewportChange
+  // fires and we drop out of live mode.
   const [viewport, setViewport] = useState<{ startNs: bigint; endNs: bigint }>(() => {
     const now = BigInt(Date.now()) * 1_000_000n;
-    return { startNs: now - 60_000_000_000n, endNs: now };
+    return { startNs: now - LIVE_WINDOW_NS, endNs: now };
   });
   const [spikes, setSpikes] = useState<SpikeMarker[]>([]);
   const [focusedSpike, setFocusedSpike] = useState<SpikeMarker | null>(null);
@@ -45,18 +50,6 @@ export function App() {
     setFocusedSpike(s);
     setDrilldownSpike(s);
   }, []);
-
-  // Follow-now: every time the live stream advances we snap the viewport
-  // to `[lastTs - window, lastTs]`. The user scrolling kicks us out of
-  // live mode (that branch is below in the wheel handler).
-  useEffect(() => {
-    if (!live) return;
-    if (liveStream.lastTsNs === 0n) return;
-    setViewport({
-      startNs: liveStream.lastTsNs - LIVE_WINDOW_NS,
-      endNs: liveStream.lastTsNs,
-    });
-  }, [live, liveStream.lastTsNs]);
 
   const onMeasure = useCallback((a: bigint, b: bigint) => {
     setMeasurement({
@@ -80,9 +73,9 @@ export function App() {
     document.addEventListener("drop", (e) => e.preventDefault());
   }, []);
 
-  // Any explicit viewport change that isn't driven by the live follow
-  // effect means the user grabbed the timeline; drop out of live mode so
-  // they can navigate without it fighting back.
+  // Any viewport change comes from user interaction (pan, zoom, double-click).
+  // The Timeline does NOT call this on every RAF frame while live — that part
+  // is internal — so this is safe to bounce us out of live mode.
   const onViewportChange = useCallback(
     (v: { startNs: bigint; endNs: bigint }) => {
       setViewport(v);
@@ -113,7 +106,7 @@ export function App() {
           {live ? "LIVE" : "LIVE OFF"}
         </button>
         <div className="zoom-hint">
-          scroll to zoom · drag to pan · click to drilldown · shift-click to measure
+          scroll/drag = pan · ctrl+scroll = zoom · double-click = now · shift-click = measure
         </div>
       </div>
       <Timeline
@@ -125,6 +118,8 @@ export function App() {
         spikes={spikes}
         onSpikeClick={onSpikeClick}
         liveSeries={live ? liveStream.series : null}
+        liveLastTsNs={liveStream.lastTsNs}
+        live={live}
       />
       <SidePanel
         selection={selection}
