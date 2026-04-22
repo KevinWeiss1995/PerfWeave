@@ -10,7 +10,7 @@ use crate::clock_sync::OffsetHandle;
 use crate::ring::EventRing;
 use perfweave_common::intern::Interner;
 use perfweave_proto::v1::{
-    collector_client::CollectorClient, AgentHello, Batch, StringIntern,
+    collector_client::CollectorClient, AgentHello, Batch, ClockOffset, StringIntern,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +23,9 @@ pub struct UploaderConfig {
     pub num_gpus: u32,
     pub max_batch_events: usize,
     pub flush_interval_ms: u64,
+    /// Address the server should hit back for `PerfweaveAgent.ProfileKernels`.
+    /// Empty string disables replay-profile discovery on the server side.
+    pub agent_rpc_addr: String,
 }
 
 pub async fn run(
@@ -72,6 +75,8 @@ async fn run_session(
         hostname: cfg.hostname.clone(),
         agent_version: perfweave_common::PRODUCT_VERSION.to_string(),
         num_gpus: cfg.num_gpus,
+        agent_rpc_addr: cfg.agent_rpc_addr.clone(),
+        device_peaks: Vec::new(),
     };
     let ack = client.register(hello).await?.into_inner();
     tracing::info!(assigned_node_id = ack.assigned_node_id, "registered with collector");
@@ -88,7 +93,8 @@ async fn run_session(
             _ = shutdown.changed() => if *shutdown.borrow() { break; },
             _ = flush_tick.tick() => {
                 let events = ring.drain_up_to(cfg.max_batch_events);
-                if events.is_empty() { continue; }
+                let metric_frames = ring.drain_frames();
+                if events.is_empty() && metric_frames.is_empty() { continue; }
                 let off = offsets.current();
                 let mut strings: Vec<StringIntern> = Vec::new();
                 let corrected: Vec<_> = events.into_iter().map(|mut e| {
@@ -102,7 +108,6 @@ async fn run_session(
                     }
                     e
                 }).collect();
-                // Intern any metric_unit strings we have not announced yet.
                 for e in &corrected {
                     if let Some(perfweave_proto::v1::event::Payload::Metric(m)) = &e.payload {
                         if !m.unit.is_empty() {
@@ -111,7 +116,18 @@ async fn run_session(
                         }
                     }
                 }
-                let batch = Batch { events: corrected, strings, offsets: Vec::new() };
+                // Every batch carries the latest clock fit so the server can
+                // apply skew correction even if it's only just come online.
+                let batch_offsets: Vec<ClockOffset> = offsets
+                    .latest_proto(cfg.node_id)
+                    .into_iter()
+                    .collect();
+                let batch = Batch {
+                    events: corrected,
+                    strings,
+                    offsets: batch_offsets,
+                    metric_frames,
+                };
                 if let Err(e) = tx.send(batch).await {
                     return Err(anyhow::anyhow!("collector stream closed: {e}"));
                 }
@@ -124,8 +140,13 @@ async fn run_session(
             }
             _ = dropped_tick.tick() => {
                 let d = ring.take_dropped();
-                if d > 0 {
-                    tracing::warn!(dropped_events = d, "ring buffer overflowed; raise --ring-capacity or reduce sampling rate");
+                let df = ring.take_dropped_frames();
+                if d > 0 || df > 0 {
+                    tracing::warn!(
+                        dropped_events = d,
+                        dropped_frames = df,
+                        "ring buffer overflowed; raise --ring-capacity or reduce sampling rate"
+                    );
                 }
             }
         }
