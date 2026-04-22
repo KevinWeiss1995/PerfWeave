@@ -39,9 +39,14 @@ pub async fn run(opts: Opts) {
         }
         vec![Box::new(SyntheticSampler {
             num_gpus: opts.synthetic_gpus.max(1),
-            metric_hz: 1000,
+            // 1 Hz is enough for the live tail (spike detection runs on
+            // the server at 1 Hz). `perfweave start --synthetic` with
+            // --synthetic-burst gets you kernel traffic too; without it,
+            // we stay cheap.
+            metric_hz: 1,
             node_id: 0,
             seed: 0xC0FFEE,
+            burst: true,
         })]
     } else {
         build_real_samplers()
@@ -67,6 +72,7 @@ pub async fn run(opts: Opts) {
             num_gpus,
             max_batch_events: 20_000,
             flush_interval_ms: 250,
+            agent_rpc_addr: String::new(),
         },
         ring,
         offsets,
@@ -79,11 +85,21 @@ pub async fn run(opts: Opts) {
 #[allow(unused_mut)]
 fn build_real_samplers() -> Vec<Box<dyn Sampler>> {
     let mut out: Vec<Box<dyn Sampler>> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        if perfweave_agent::sampler::tegra::is_tegra() {
+            out.push(Box::new(perfweave_agent::sampler::tegra::TegraSampler {
+                node_id: 0,
+                metric_hz: 1,
+            }));
+            return out;
+        }
+    }
     #[cfg(feature = "nvml")]
     {
         out.push(Box::new(perfweave_agent::sampler::nvml::NvmlSampler {
             node_id: 0,
-            metric_hz: 10,
+            metric_hz: 1,
         }));
     }
     out
