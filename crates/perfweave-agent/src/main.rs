@@ -29,9 +29,10 @@ async fn main() -> Result<()> {
     let samplers: Vec<Box<dyn Sampler>> = if cfg.synthetic {
         vec![Box::new(SyntheticSampler {
             num_gpus: cfg.synthetic_gpus,
-            metric_hz: cfg.metric_hz.max(1000),
+            metric_hz: cfg.metric_hz,
             node_id: cfg.node_id,
             seed: 0xC0FFEE_u64,
+            burst: cfg.synthetic_burst,
         })]
     } else {
         build_real_samplers(&cfg)
@@ -50,6 +51,14 @@ async fn main() -> Result<()> {
         });
     }
 
+    // The address we advertise must be reachable by the server. If the
+    // user left it at the 127.0.0.1 default, the server will only be able
+    // to reach us when it runs on the same host; we log a hint.
+    let agent_rpc_addr = if cfg.rpc_listen.is_empty() {
+        String::new()
+    } else {
+        format!("http://{}", cfg.rpc_listen)
+    };
     let uploader = grpc_client::run(
         UploaderConfig {
             collector_url: cfg.collector.clone(),
@@ -58,12 +67,25 @@ async fn main() -> Result<()> {
             num_gpus,
             max_batch_events: 20_000,
             flush_interval_ms: 250,
+            agent_rpc_addr,
         },
         ring.clone(),
         offsets.clone(),
         interner.clone(),
         shutdown_rx.clone(),
     );
+
+    // Spin up the on-demand replay-profile RPC server so the API server
+    // can ask us to re-profile specific kernels.
+    if !cfg.rpc_listen.is_empty() {
+        let bind: std::net::SocketAddr = cfg.rpc_listen.parse()?;
+        let synthetic = cfg.synthetic;
+        tokio::spawn(async move {
+            if let Err(e) = perfweave_agent::rpc_server::serve(bind, synthetic).await {
+                tracing::error!(error=%e, "agent RPC server exited");
+            }
+        });
+    }
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::select! {
@@ -80,6 +102,22 @@ async fn main() -> Result<()> {
 fn build_real_samplers(_cfg: &AgentConfig) -> Vec<Box<dyn Sampler>> {
     #[allow(unused_mut)]
     let mut out: Vec<Box<dyn Sampler>> = Vec::new();
+
+    // Jetson/Tegra: NVML is crippled on these SoCs (no util, flaky power).
+    // Auto-select the Tegra sysfs sampler when the kernel looks like
+    // L4T. User can force with PERFWEAVE_FORCE_TEGRA=1.
+    #[cfg(target_os = "linux")]
+    {
+        if perfweave_agent::sampler::tegra::is_tegra() {
+            tracing::info!("detected Tegra/Jetson; using sysfs sampler instead of NVML");
+            out.push(Box::new(perfweave_agent::sampler::tegra::TegraSampler {
+                node_id: _cfg.node_id,
+                metric_hz: _cfg.metric_hz,
+            }));
+            return out;
+        }
+    }
+
     #[cfg(feature = "nvml")]
     {
         out.push(Box::new(perfweave_agent::sampler::nvml::NvmlSampler {
