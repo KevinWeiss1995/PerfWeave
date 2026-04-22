@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 perfweave-common = { path = "../perfweave-common" }
-perfweave-api = { path = "../perfweave-api" }
+perfweave-server = { path = "../perfweave-server" }
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true

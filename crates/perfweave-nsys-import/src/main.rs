@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use perfweave_api::{ch::{Ch, ChConfig}, imports::import_nsys};
+use perfweave_server::{api::imports::import_nsys, store::ch::{Ch, ChConfig}};
 
 #[derive(Parser, Debug)]
 #[command(name = "perfweave-nsys-import")]
