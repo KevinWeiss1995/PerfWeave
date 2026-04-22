@@ -1,10 +1,12 @@
 //! Unified PerfWeave server: ingest + api + live plane in one binary.
 //!
 //! Per `.cursorrules`: `perfweave start` must work with no flags. The
-//! defaults below (0.0.0.0:7777 http, 0.0.0.0:7700 grpc, ClickHouse on
-//! localhost) give you that. Override via env for non-trivial deploys.
+//! defaults are sourced from `perfweave_common::ports` so the CLI, the
+//! server, and the agent upload target all agree without each file
+//! hardcoding its own copy.
 
 use clap::Parser;
+use perfweave_common::ports;
 use perfweave_server::{run, AppConfig};
 use std::path::PathBuf;
 
@@ -12,11 +14,11 @@ use std::path::PathBuf;
 #[command(name = "perfweave-server", version, about = "PerfWeave unified server")]
 struct Cli {
     /// HTTP/GraphQL/SSE listen address.
-    #[arg(long, default_value = "0.0.0.0:7777")]
+    #[arg(long, default_value_t = format!("0.0.0.0:{}", ports::API_HTTP))]
     http: String,
 
     /// gRPC ingest listen address.
-    #[arg(long, default_value = "0.0.0.0:7700")]
+    #[arg(long, default_value_t = format!("0.0.0.0:{}", ports::COLLECTOR_GRPC))]
     grpc: String,
 
     /// Optional path to the frontend bundle (served as static assets).
