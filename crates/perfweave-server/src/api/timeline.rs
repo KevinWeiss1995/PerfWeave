@@ -122,7 +122,6 @@ async fn serve_activity(state: &AppState, q: &TimelineQuery) -> anyhow::Result<B
           {cat_filter}
         GROUP BY bucket_start_ns, bucket_width_ns, gpu_id, category
         ORDER BY bucket_start_ns, gpu_id, category
-        FORMAT RowBinaryWithNamesAndTypes
         "#,
         width = width,
         start = q.start_ns,
