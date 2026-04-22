@@ -52,6 +52,18 @@ interface Props {
   liveLastTsNs?: bigint;
   /** True when the user wants the timeline to follow real time. */
   live?: boolean;
+  /** EMA of (server_wall_ns - client_wall_ns). Added to client wall-clock
+   *  when computing the virtual "now" so the tape stays aligned when the
+   *  server runs on a different host. NaN until first SSE frame. */
+  skewNs?: number;
+  /** ms since the newest live sample arrived. Timeline surfaces this in
+   *  the HUD and dims the now-line when stale. */
+  lastSampleAgeMs?: number;
+  /** Live sample rates, surfaced in the HUD. */
+  metricRateHz?: number;
+  kernelRateHz?: number;
+  /** True if the EventSource currently has an open connection. */
+  connected?: boolean;
 }
 
 const NUM_GPUS = 2;
@@ -83,6 +95,11 @@ export function Timeline({
   liveKernelsTick = 0,
   liveLastTsNs = 0n,
   live = false,
+  skewNs = NaN,
+  lastSampleAgeMs = Number.POSITIVE_INFINITY,
+  metricRateHz = 0,
+  kernelRateHz = 0,
+  connected = false,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const mainRef = useRef<HTMLDivElement | null>(null);
@@ -98,14 +115,20 @@ export function Timeline({
   const viewportRef = useRef(viewport);
   const liveRef = useRef(live);
   const liveLastTsNsRef = useRef(liveLastTsNs);
+  const skewNsRef = useRef<number>(skewNs);
   useEffect(() => { viewportRef.current = viewport; }, [viewport]);
   useEffect(() => { liveRef.current = live; }, [live]);
   useEffect(() => { liveLastTsNsRef.current = liveLastTsNs; }, [liveLastTsNs]);
+  useEffect(() => { skewNsRef.current = skewNs; }, [skewNs]);
 
   // --- Resolve metric_id → name lazily via /graphql. Keyed off
   //     liveLastTsNs because the live ring's Map reference is stable, so
   //     we need an explicit heartbeat to notice new metric_ids.
   const [metricCatalog, setMetricCatalog] = useState<Map<string, MetricSpec>>(new Map());
+  // Kernel-name cache. Keyed by nameId (u64 as string). We fill it lazily
+  // from live kernels as they arrive; used by the hover tooltip.
+  const kernelNameCacheRef = useRef<Map<string, string>>(new Map());
+  const [kernelNameVersion, setKernelNameVersion] = useState(0);
   useEffect(() => {
     if (!liveSeries) return;
     const unknown: bigint[] = [];
@@ -153,11 +176,28 @@ export function Timeline({
     return out;
   }, []);
 
-  // --- Gutter model: one row per lane, with label + color + last known value.
+  // --- Gutter model: one row per lane.
+  //
+  // Multiple metrics can map to the same slot (e.g. on Jetson both
+  // `soc.power.gpu.watts` and `gpu.power.watts` classify to the power
+  // slot; on discrete GPUs `mem.util` and `mem.used` both land on mem).
+  // Rather than silently pick one and clobber the other, we show the
+  // primary label and stack sub-values for every metric that actually has
+  // live data on this (gpu, slot).
   const gutterRows = useMemo(() => {
-    type Row = { laneIdx: number; label: string; sub: string; rgb: [number, number, number]; heightPx: number };
-    const rows: Row[] = [];
-    const laneLiveValue = new Map<number, number>();   // laneIdx -> latest value
+    type ValuePart = { label: string; value: string };
+    type Row = {
+      laneIdx: number;
+      label: string;
+      subGpu: string;
+      parts: ValuePart[];
+      rgb: [number, number, number];
+      heightPx: number;
+    };
+
+    // (gpu, slot) -> list of {spec, latest}
+    type Entry = { spec: MetricSpec; latest: number };
+    const perLane = new Map<number, Entry[]>();
     if (liveSeries) {
       for (const [key, samples] of liveSeries) {
         if (samples.length === 0) continue;
@@ -166,19 +206,35 @@ export function Timeline({
         const spec = metricCatalog.get(mid);
         if (!spec) continue;
         const laneIdx = gpu * LANES_PER_GPU + spec.slot;
-        laneLiveValue.set(laneIdx, samples[samples.length - 1].value);
+        let arr = perLane.get(laneIdx);
+        if (!arr) {
+          arr = [];
+          perLane.set(laneIdx, arr);
+        }
+        arr.push({ spec, latest: samples[samples.length - 1].value });
       }
     }
+
+    const rows: Row[] = [];
     for (let g = 0; g < NUM_GPUS; g++) {
       for (let s = 0; s < METRIC_SLOTS; s++) {
         const laneIdx = g * LANES_PER_GPU + s;
-        const spec = firstSpecForSlot(metricCatalog, s);
-        const val = laneLiveValue.get(laneIdx);
+        const entries = perLane.get(laneIdx) ?? [];
+        entries.sort((a, b) => a.spec.label.localeCompare(b.spec.label));
+        const primary = entries[0]?.spec ?? firstSpecForSlot(metricCatalog, s);
+        const parts: ValuePart[] =
+          entries.length > 0
+            ? entries.map((e) => ({
+                label: e.spec.label,
+                value: e.spec.format(e.latest),
+              }))
+            : [];
         rows.push({
           laneIdx,
-          label: spec ? spec.label : slotPlaceholder(s),
-          sub: `gpu${g}${val != null && spec ? " · " + spec.format(val) : ""}`,
-          rgb: spec?.rgb ?? [0.4, 0.45, 0.5],
+          label: primary ? primary.label : slotPlaceholder(s),
+          subGpu: `gpu${g}`,
+          parts,
+          rgb: primary?.rgb ?? [0.4, 0.45, 0.5],
           heightPx: METRIC_LANE_HEIGHT,
         });
       }
@@ -187,7 +243,8 @@ export function Timeline({
         rows.push({
           laneIdx,
           label: ACTIVITY_LABELS[a],
-          sub: `gpu${g}`,
+          subGpu: `gpu${g}`,
+          parts: [],
           rgb: ACTIVITY_COLORS[a],
           heightPx: ACTIVITY_LANE_HEIGHT,
         });
@@ -203,15 +260,35 @@ export function Timeline({
     rendererRef.current = renderer;
     renderer.setLanes(lanes);
 
-    const ro = new ResizeObserver(() => {
+    const applyResize = () => {
       if (!canvasRef.current) return;
       const { clientWidth, clientHeight } = canvasRef.current;
       renderer.resize(clientWidth, clientHeight, window.devicePixelRatio || 1);
-    });
+    };
+
+    const ro = new ResizeObserver(applyResize);
     ro.observe(canvas);
+
+    // DPR changes (external monitor hot-swap, browser zoom) don't fire
+    // ResizeObserver because the CSS size doesn't change. We listen for
+    // them via a `(resolution: <current>dppx)` media query that flips as
+    // soon as DPR moves.
+    let mql: MediaQueryList | null = null;
+    const hookDpr = () => {
+      mql?.removeEventListener?.("change", onDprChange);
+      const dpr = window.devicePixelRatio || 1;
+      mql = window.matchMedia(`(resolution: ${dpr}dppx)`);
+      mql.addEventListener?.("change", onDprChange);
+    };
+    const onDprChange = () => {
+      applyResize();
+      hookDpr(); // media query is DPR-specific; re-hook to the new DPR
+    };
+    hookDpr();
 
     return () => {
       ro.disconnect();
+      mql?.removeEventListener?.("change", onDprChange);
       rendererRef.current = null;
     };
   }, [lanes]);
@@ -259,6 +336,11 @@ export function Timeline({
     })();
   }, [viewport, useSynthetic, lanes, liveSeries, liveLastTsNs, metricCatalog]);
 
+  // Parallel to the renderer's batches: `kernelsByBatchRef.current[b][i]`
+  // is the LiveKernel that produced the bar at `{batch: b, index: i}`.
+  // Populated alongside setActivity; read by hover/click hit-testing.
+  const kernelsByBatchRef = useRef<LiveKernel[][]>([]);
+
   // --- Rebuild activity (kernels) lane from the live kernel ring. Keyed
   //     on liveKernelsTick (~10 Hz heartbeat) instead of the ring
   //     reference, which is stable.
@@ -267,8 +349,41 @@ export function Timeline({
     if (!r) return;
     if (useSynthetic) return;
     if (!liveKernels) return;
-    r.setActivity(liveKernelsToBatches(liveKernels, LANES_PER_GPU));
+    const { batches, kernelsByBatch } = liveKernelsToBatches(liveKernels, LANES_PER_GPU);
+    r.setActivity(batches);
+    kernelsByBatchRef.current = kernelsByBatch;
   }, [liveKernels, liveKernelsTick, useSynthetic]);
+
+  // --- Resolve kernel name_id → symbol name lazily. We opportunistically
+  //     batch unknown ids so we do one roundtrip per 10 Hz heartbeat.
+  useEffect(() => {
+    if (!liveKernels || liveKernels.length === 0) return;
+    const cache = kernelNameCacheRef.current;
+    const unknown = new Set<bigint>();
+    for (const k of liveKernels) {
+      if (!cache.has(k.nameId)) {
+        try {
+          unknown.add(BigInt(k.nameId));
+        } catch {
+          // malformed id, skip
+        }
+      }
+    }
+    if (unknown.size === 0) return;
+    let cancelled = false;
+    resolveStrings(Array.from(unknown))
+      .then((names) => {
+        if (cancelled) return;
+        for (const [id, name] of names) {
+          cache.set(id.toString(), name);
+        }
+        setKernelNameVersion((v) => (v + 1) | 0);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [liveKernels, liveKernelsTick]);
 
   // --- RAF: advance virtual clock, render. This effect mounts ONCE and
   //     reads everything through refs. Putting `nowNs` in state caused the
@@ -286,9 +401,16 @@ export function Timeline({
       // scrolls smoothly between 1 Hz samples. When a fresher server ts
       // arrives we snap forward so we stay aligned.
       if (liveRef.current) {
-        const wall = BigInt(Date.now()) * 1_000_000n;
+        // Use server wall-clock as our "now" when we have a skew estimate;
+        // otherwise fall back to the client clock. Keeps the tape aligned
+        // across hosts (Jetson-over-SSH, docker-on-laptop, etc).
+        const clientWall = BigInt(Date.now()) * 1_000_000n;
+        const skew = skewNsRef.current;
+        const serverWall = Number.isFinite(skew)
+          ? clientWall + BigInt(Math.round(skew))
+          : clientWall;
         const last = liveLastTsNsRef.current;
-        const anchored = last > 0n && last > wall ? last : wall;
+        const anchored = last > 0n && last > serverWall ? last : serverWall;
         nowNsRef.current =
           anchored > nowNsRef.current ? anchored : nowNsRef.current + 16_666_666n;
       }
@@ -361,23 +483,93 @@ export function Timeline({
     onViewportChange({ startNs: startNs + dNs, endNs: endNs + dNs });
   };
 
-  const dragRef = useRef<{ x: number; startNs: bigint; endNs: bigint } | null>(null);
+  const dragRef = useRef<{ x: number; startNs: bigint; endNs: bigint; moved: boolean } | null>(null);
+
+  // Hover state for the kernel tooltip. Kept in state because the tooltip
+  // is a small React subtree; the gutter/axis memos aren't affected.
+  interface KernelHover {
+    x: number;          // pointer x relative to timeline-main
+    y: number;
+    kernel: LiveKernel;
+    name: string | null;
+    siblingCount: number;
+  }
+  const [hoverKernel, setHoverKernel] = useState<KernelHover | null>(null);
+
   const onMouseDown = (e: React.MouseEvent) => {
     const { startNs, endNs } = effViewport();
-    dragRef.current = { x: e.clientX, startNs, endNs };
+    dragRef.current = { x: e.clientX, startNs, endNs, moved: false };
   };
   const onMouseMove = (e: React.MouseEvent) => {
-    if (!dragRef.current) return;
-    const c = canvasRef.current!;
-    const dx = e.clientX - dragRef.current.x;
-    const range = dragRef.current.endNs - dragRef.current.startNs;
-    const dNs = BigInt(-Math.floor((dx / c.clientWidth) * Number(range)));
-    onViewportChange({
-      startNs: dragRef.current.startNs + dNs,
-      endNs: dragRef.current.endNs + dNs,
+    // Pan drag has priority over hover — we don't want tooltips chasing the
+    // cursor while the user is dragging the timeline.
+    if (dragRef.current) {
+      const c = canvasRef.current!;
+      const dx = e.clientX - dragRef.current.x;
+      if (Math.abs(dx) > 2) dragRef.current.moved = true;
+      const range = dragRef.current.endNs - dragRef.current.startNs;
+      const dNs = BigInt(-Math.floor((dx / c.clientWidth) * Number(range)));
+      onViewportChange({
+        startNs: dragRef.current.startNs + dNs,
+        endNs: dragRef.current.endNs + dNs,
+      });
+      if (hoverKernel) setHoverKernel(null);
+      return;
+    }
+
+    // Hover hit-test against the kernel activity lanes only; metric lanes
+    // don't have per-bar data to show.
+    const r = rendererRef.current;
+    const c = canvasRef.current;
+    const main = mainRef.current;
+    if (!r || !c || !main) return;
+    const rect = c.getBoundingClientRect();
+    const xPx = e.clientX - rect.left;
+    const yPx = e.clientY - rect.top;
+    const vp = effViewport();
+    const hit = r.pick(
+      { startNs: vp.startNs, endNs: vp.endNs, widthPx: c.clientWidth, heightPx: c.clientHeight },
+      xPx,
+      yPx,
+    );
+    if (!hit) {
+      if (hoverKernel) setHoverKernel(null);
+      return;
+    }
+    const refs = kernelsByBatchRef.current[hit.batch];
+    const kernel = refs?.[hit.index];
+    if (!kernel) {
+      if (hoverKernel) setHoverKernel(null);
+      return;
+    }
+    const name = kernelNameCacheRef.current.get(kernel.nameId) ?? null;
+    // Count siblings in the current window. O(n) but n is capped by the
+    // renderer's live kernel ring (≤200k) — a single scan of the parallel
+    // array is ~0.2ms in practice and we throttle via pointermove rate.
+    let siblingCount = 0;
+    const liveRing = liveKernels ?? [];
+    for (let i = 0; i < liveRing.length; i++) {
+      if (liveRing[i].nameId === kernel.nameId) siblingCount++;
+    }
+    const mainRect = main.getBoundingClientRect();
+    setHoverKernel({
+      x: e.clientX - mainRect.left,
+      y: e.clientY - mainRect.top,
+      kernel,
+      name,
+      siblingCount,
     });
   };
-  const onMouseUp = () => { dragRef.current = null; };
+  const lastDragMovedRef = useRef(false);
+  const onMouseUp = () => {
+    lastDragMovedRef.current = dragRef.current?.moved ?? false;
+    dragRef.current = null;
+  };
+  const onMouseLeave = () => {
+    lastDragMovedRef.current = dragRef.current?.moved ?? false;
+    dragRef.current = null;
+    if (hoverKernel) setHoverKernel(null);
+  };
 
   // Double-click: snap to "now" with the default window. Feels like the
   // equivalent of hitting Home.
@@ -387,6 +579,12 @@ export function Timeline({
   };
 
   const onClick = (e: React.MouseEvent) => {
+    // Suppress click-to-select if the user was panning. Without this, every
+    // finished drag also selects whichever kernel landed under the cursor.
+    if (lastDragMovedRef.current) {
+      lastDragMovedRef.current = false;
+      return;
+    }
     const r = rendererRef.current;
     const c = canvasRef.current;
     if (!r || !c) return;
@@ -451,8 +649,20 @@ export function Timeline({
               style={{ background: rgbCss(row.rgb) }}
             />
             <span className="lane-label-text">
-              <span className="lane-label-name">{row.label}</span>
-              <span className="lane-label-sub">{row.sub}</span>
+              <span className="lane-label-name">
+                {row.label}
+                <span className="lane-label-gpu">{row.subGpu}</span>
+              </span>
+              {row.parts.length > 0 && (
+                <span className="lane-label-values" title={row.parts.map((p) => p.label).join(" · ")}>
+                  {row.parts.map((p, i) => (
+                    <span key={p.label} className="lane-label-value">
+                      {i > 0 && <span className="lane-label-sep">·</span>}
+                      {p.value}
+                    </span>
+                  ))}
+                </span>
+              )}
             </span>
           </div>
         ))}
@@ -465,10 +675,17 @@ export function Timeline({
           onMouseDown={onMouseDown}
           onMouseMove={onMouseMove}
           onMouseUp={onMouseUp}
-          onMouseLeave={onMouseUp}
+          onMouseLeave={onMouseLeave}
           onClick={onClick}
           onDoubleClick={onDoubleClick}
         />
+        {hoverKernel && (
+          <KernelTooltip
+            hover={hoverKernel}
+            nameFallback={kernelNameCacheRef.current.get(hoverKernel.kernel.nameId) ?? hoverKernel.name}
+            nameVersion={kernelNameVersion}
+          />
+        )}
         {/* Right-edge fade: subtle "data incoming" gradient. */}
         {live && <div className="live-edge-fade" />}
         {/* Now line: vertical rule at the right edge in live mode. */}
@@ -503,17 +720,118 @@ export function Timeline({
       </div>
 
       <div className="overlay-hud">
-        {fps} fps · {formatNs(v.endNs - v.startNs)} window
-        {live && " · live"}
+        <span className="hud-item">{fps} fps</span>
+        <span className="hud-sep">·</span>
+        <span className="hud-item">{formatNs(v.endNs - v.startNs)} window</span>
+        {live && (
+          <>
+            <span className="hud-sep">·</span>
+            <span className={`hud-pill ${connectionClass(connected, lastSampleAgeMs)}`}>
+              {connectionLabel(connected, lastSampleAgeMs)}
+            </span>
+            <span className="hud-sep">·</span>
+            <span className="hud-item" title="metric frames / kernel events per second">
+              {metricRateHz.toFixed(1)} Hz · {formatKernelRate(kernelRateHz)}
+            </span>
+            {Number.isFinite(skewNs) && Math.abs(skewNs) > 5_000_000 && (
+              <>
+                <span className="hud-sep">·</span>
+                <span
+                  className="hud-item hud-warn"
+                  title="Estimated clock skew between server and this browser (including SSE transport latency)."
+                >
+                  skew {formatSkew(skewNs)}
+                </span>
+              </>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
+}
+
+function connectionClass(connected: boolean, ageMs: number): string {
+  if (!connected) return "hud-pill--down";
+  if (!Number.isFinite(ageMs) || ageMs > 3000) return "hud-pill--stale";
+  return "hud-pill--live";
+}
+
+function connectionLabel(connected: boolean, ageMs: number): string {
+  if (!connected) return "DISCONNECTED";
+  if (!Number.isFinite(ageMs)) return "CONNECTING";
+  if (ageMs > 3000) return `STALE ${(ageMs / 1000).toFixed(1)}s`;
+  return "LIVE";
+}
+
+function formatKernelRate(k: number): string {
+  if (k <= 0) return "0 kern/s";
+  if (k >= 1000) return `${(k / 1000).toFixed(1)}k kern/s`;
+  return `${k.toFixed(0)} kern/s`;
+}
+
+function formatSkew(ns: number): string {
+  const absMs = Math.abs(ns) / 1e6;
+  const sign = ns >= 0 ? "+" : "-";
+  if (absMs < 1000) return `${sign}${absMs.toFixed(0)}ms`;
+  return `${sign}${(absMs / 1000).toFixed(1)}s`;
 }
 
 // --- Helpers ---------------------------------------------------------------
 
 function rgbCss([r, g, b]: [number, number, number]): string {
   return `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`;
+}
+
+interface KernelHoverProps {
+  hover: {
+    x: number;
+    y: number;
+    kernel: LiveKernel;
+    name: string | null;
+    siblingCount: number;
+  };
+  nameFallback: string | null;
+  // Only here so the tooltip re-renders when the name cache updates.
+  nameVersion: number;
+}
+
+function KernelTooltip({ hover, nameFallback }: KernelHoverProps) {
+  const k = hover.kernel;
+  const name = nameFallback ?? `#${shortId(k.nameId)}`;
+  // Offset tooltip so the cursor doesn't obscure it. Flip to the left side
+  // if we're too close to the right edge.
+  const style: React.CSSProperties = {
+    left: hover.x + 14,
+    top: hover.y + 14,
+  };
+  return (
+    <div className="kernel-tooltip" style={style}>
+      <div className="kernel-tooltip__name" title={name}>{name}</div>
+      <div className="kernel-tooltip__row">
+        <span className="k">duration</span>
+        <span className="v">{formatNs(BigInt(Math.max(1, k.durationNs)))}</span>
+      </div>
+      <div className="kernel-tooltip__row">
+        <span className="k">gpu</span>
+        <span className="v">{k.gpuId}</span>
+      </div>
+      <div className="kernel-tooltip__row">
+        <span className="k">corr</span>
+        <span className="v">{shortId(k.correlationId)}</span>
+      </div>
+      <div className="kernel-tooltip__row">
+        <span className="k">launches (ring)</span>
+        <span className="v">{hover.siblingCount.toLocaleString()}</span>
+      </div>
+      <div className="kernel-tooltip__hint">click → highlight siblings</div>
+    </div>
+  );
+}
+
+function shortId(id: string): string {
+  if (id.length <= 10) return id;
+  return id.slice(0, 6) + "…" + id.slice(-3);
 }
 
 function firstSpecForSlot(catalog: Map<string, MetricSpec>, slot: number): MetricSpec | null {
@@ -657,38 +975,52 @@ function arrowToMetrics(
 // Convert the live kernel ring → renderer InstanceBatches. One batch per
 // GPU drops into the "kernels" activity lane. Duration clamps to 1 ns so
 // zero-length entries still get a 1 px bar at close zooms.
-function liveKernelsToBatches(kernels: LiveKernel[], lanesPerGpu: number): InstanceBatch[] {
-  if (kernels.length === 0) return [];
-  const perGpu = new Map<number, { s: number[]; w: number[]; corr: number[] }>();
+//
+// We store `nameId.lo32` (NOT `correlation_id`) in `corrLo` because the
+// renderer uses that field to highlight "all instances that share this
+// id" — and what users actually want on click is "show me every launch
+// of *this* kernel", which corresponds to name_id. correlation_id is
+// globally unique per launch, so highlighting on it would only ever
+// light up one bar. The nameId-based metadata also drives the hover
+// tooltip.
+function liveKernelsToBatches(
+  kernels: LiveKernel[],
+  lanesPerGpu: number,
+): { batches: InstanceBatch[]; kernelsByBatch: LiveKernel[][] } {
+  if (kernels.length === 0) return { batches: [], kernelsByBatch: [] };
+  const perGpu = new Map<
+    number,
+    { s: number[]; w: number[]; nameLo: number[]; refs: LiveKernel[] }
+  >();
   for (const k of kernels) {
     let g = perGpu.get(k.gpuId);
     if (!g) {
-      g = { s: [], w: [], corr: [] };
+      g = { s: [], w: [], nameLo: [], refs: [] };
       perGpu.set(k.gpuId, g);
     }
     g.s.push(k.tsNs);
     g.w.push(Math.max(1, k.durationNs));
-    // Correlation lo32 — store the lower 32 bits of name_id (u64 string)
-    // so clicking a kernel bar can highlight all sibling launches of the
-    // same kernel. We parse the string as BigInt and mask.
     try {
-      g.corr.push(Number(BigInt(k.correlationId) & 0xffffffffn));
+      g.nameLo.push(Number(BigInt(k.nameId) & 0xffffffffn));
     } catch {
-      g.corr.push(0);
+      g.nameLo.push(0);
     }
+    g.refs.push(k);
   }
-  const out: InstanceBatch[] = [];
+  const batches: InstanceBatch[] = [];
+  const kernelsByBatch: LiveKernel[][] = [];
   for (const [gpuId, g] of perGpu) {
-    const laneIdx = gpuId * lanesPerGpu + METRIC_SLOTS + 0; // kernels is activity slot 0
-    out.push({
+    const laneIdx = gpuId * lanesPerGpu + METRIC_SLOTS + 0;
+    batches.push({
       lane: laneIdx,
-      colorId: 0, // KERNEL color from shader palette
+      colorId: 0,
       starts: Float64Array.from(g.s),
       widths: Float64Array.from(g.w),
-      corrLo: Float32Array.from(g.corr),
+      corrLo: Float32Array.from(g.nameLo),
     });
+    kernelsByBatch.push(g.refs);
   }
-  return out;
+  return { batches, kernelsByBatch };
 }
 
 // Convert the client-side live ring → renderer MetricSeries. If a metric
