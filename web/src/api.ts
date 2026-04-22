@@ -74,28 +74,16 @@ export async function fetchTopKernels(startNs: bigint, endNs: bigint, gpuId?: nu
 }
 
 export async function fetchSpikes(startNs: bigint, endNs: bigint) {
-  return gql<{ spikes: { bucketStartNs: string; bucketWidthNs: string; gpuId: number; metricId: string; value: number; zMad: number }[] }>(
+  return gql<{ spikes: { bucketStartNs: string; bucketWidthNs: string; nodeId: number; gpuId: number; metricId: string; value: number; zMad: number }[] }>(
     `query ($s: UInt64!, $e: UInt64!) {
       spikes(startNs: $s, endNs: $e) {
         bucketStartNs: bucket_start_ns bucketWidthNs: bucket_width_ns
-        gpuId: gpu_id metricId: metric_id value zMad: z_mad
+        nodeId: node_id gpuId: gpu_id metricId: metric_id value zMad: z_mad
       }
     }`,
     { s: startNs.toString(), e: endNs.toString() },
   );
 }
-
-export type SpikeContext = {
-  bucketStartNs: string;
-  bucketWidthNs: string;
-  gpuId: number;
-  metricId: string;
-  metricName: string;
-  bottleneck: "COMPUTE_BOUND" | "MEMORY_BOUND" | "UNCLASSIFIED";
-  avgMemUtil: number;
-  avgGpuUtil: number;
-  topKernels: { nameId: string; name: string; totalDurationNs: string; launches: string; meanDurationNs: string }[];
-};
 
 export async function fetchSpikeContext(
   bucketStartNs: bigint,
@@ -118,6 +106,27 @@ export async function fetchSpikeContext(
           nameId: name_id name totalDurationNs: total_duration_ns
           launches meanDurationNs: mean_duration_ns
         }
+        kernelsInWindow: kernels_in_window {
+          correlationId: correlation_id
+          nameId: name_id
+          name
+          tsNs: ts_ns
+          durationNs: duration_ns
+          gpuId: gpu_id
+          sol {
+            smActivePct: sm_active_pct
+            achievedOccupancyPct: achieved_occupancy_pct
+            dramBwPct: dram_bw_pct
+            l1BwPct: l1_bw_pct
+            l2BwPct: l2_bw_pct
+            instThroughputPct: inst_throughput_pct
+            arithmeticIntensity: arithmetic_intensity
+            achievedGflops: achieved_gflops
+            bound
+            confidence
+            source
+          }
+        }
       }
     }`,
     {
@@ -125,6 +134,55 @@ export async function fetchSpikeContext(
       bw: bucketWidthNs.toString(),
       g: gpuId,
       m: metricId.toString(),
+    },
+  );
+}
+
+export type ProfileKernelsAck = {
+  nodeId: number;
+  requested: number;
+  completed: number;
+  results: KernelSol[];
+};
+
+export async function profileKernels(
+  nodeId: number,
+  gpuId: number,
+  windowStartNs: bigint,
+  windowEndNs: bigint,
+  correlationIds: bigint[],
+  timeoutMs = 5000,
+): Promise<{ profileKernels: ProfileKernelsAck }> {
+  return gql(
+    `mutation ($n: UInt32!, $g: UInt32!, $s: UInt64!, $e: UInt64!, $ids: [UInt64!]!, $t: UInt32) {
+      profileKernels(
+        nodeId: $n, gpuId: $g,
+        windowStartNs: $s, windowEndNs: $e,
+        correlationIds: $ids, timeoutMs: $t
+      ) {
+        nodeId: node_id
+        requested
+        completed
+        results {
+          smActivePct: sm_active_pct
+          achievedOccupancyPct: achieved_occupancy_pct
+          dramBwPct: dram_bw_pct
+          l1BwPct: l1_bw_pct
+          l2BwPct: l2_bw_pct
+          instThroughputPct: inst_throughput_pct
+          arithmeticIntensity: arithmetic_intensity
+          achievedGflops: achieved_gflops
+          bound confidence source
+        }
+      }
+    }`,
+    {
+      n: nodeId,
+      g: gpuId,
+      s: windowStartNs.toString(),
+      e: windowEndNs.toString(),
+      ids: correlationIds.map((i) => i.toString()),
+      t: timeoutMs,
     },
   );
 }
