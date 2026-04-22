@@ -16,8 +16,7 @@ nvml = ["dep:nvml-wrapper"]
 [dependencies]
 perfweave-common = { path = "../perfweave-common" }
 perfweave-proto = { path = "../perfweave-proto" }
-perfweave-api = { path = "../perfweave-api" }
-perfweave-collector = { path = "../perfweave-collector" }
+perfweave-server = { path = "../perfweave-server" }
 perfweave-agent = { path = "../perfweave-agent" }
 clickhouse.workspace = true
 tonic.workspace = true
