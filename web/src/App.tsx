@@ -122,6 +122,11 @@ export function App() {
         liveKernelsTick={liveStream.kernelsTick}
         liveLastTsNs={liveStream.lastTsNs}
         live={live}
+        skewNs={liveStream.skewNs}
+        lastSampleAgeMs={liveStream.lastSampleAgeMs}
+        metricRateHz={liveStream.metricRateHz}
+        kernelRateHz={liveStream.kernelRateHz}
+        connected={liveStream.connected}
       />
       <SidePanel
         selection={selection}
