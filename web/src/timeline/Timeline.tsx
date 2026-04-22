@@ -32,6 +32,9 @@ interface Props {
   onViewportChange: (v: { startNs: bigint; endNs: bigint }) => void;
   spikes?: SpikeMarker[];
   onSpikeClick?: (s: SpikeMarker) => void;
+  /** When set, metric lanes render from this client-side live ring instead
+   *  of Arrow tiles. The keys are `${nodeId}:${gpuId}:${metricId}`. */
+  liveSeries?: Map<string, { tsNs: number; value: number }[]> | null;
 }
 
 export function Timeline({
@@ -42,6 +45,7 @@ export function Timeline({
   onViewportChange,
   spikes = [],
   onSpikeClick,
+  liveSeries = null,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rendererRef = useRef<TimelineRenderer | null>(null);
@@ -86,15 +90,19 @@ export function Timeline({
     };
   }, [lanes]);
 
-  // Load data whenever viewport changes. For Week 1 gate we populate
-  // synthetically; when `useSynthetic=false` we hit the real API.
+  // Load data whenever viewport changes. Priority:
+  //   1. Synthetic mode (Week 1 gate) — self-contained.
+  //   2. Live mode — metrics from the client-side ring (no network), and
+  //      activity lanes are left to whatever we last fetched. The Live
+  //      kernels SSE will later drip-feed activity.
+  //   3. Paused mode — Arrow tiles from /api/timeline.
   useEffect(() => {
     const r = rendererRef.current;
     if (!r) return;
     r.setBaseline(viewport.startNs);
 
     if (useSynthetic) {
-      const SIZE = 10_000_000; // 10M events — the published gate
+      const SIZE = 10_000_000;
       const { batches, metrics } = generateSynthetic({
         numEvents: SIZE,
         spanMs: Number(viewport.endNs - viewport.startNs) / 1_000_000,
@@ -104,6 +112,11 @@ export function Timeline({
       r.setActivity(batches);
       r.setMetrics(metrics);
       setInstanceCount(batches.reduce((a, b) => a + b.starts.length, 0));
+      return;
+    }
+
+    if (liveSeries) {
+      r.setMetrics(liveRingToMetrics(liveSeries, lanes));
       return;
     }
 
@@ -131,7 +144,7 @@ export function Timeline({
         console.warn("timeline fetch failed; staying on previous data:", e);
       }
     })();
-  }, [viewport, useSynthetic, lanes]);
+  }, [viewport, useSynthetic, lanes, liveSeries]);
 
   // RAF loop
   useEffect(() => {
@@ -377,6 +390,53 @@ function arrowToMetrics(table: import("apache-arrow").Table, lanes: LaneLayout[]
       points: pts,
     });
   }
+  return out;
+}
+
+// Convert the client-side live ring into renderer MetricSeries. We do
+// per-series min/max normalization, same as the Arrow path, so the two
+// sources look identical when switching between Paused and Live.
+function liveRingToMetrics(
+  ring: Map<string, { tsNs: number; value: number }[]>,
+  lanes: LaneLayout[],
+): MetricSeries[] {
+  const LANES_PER_GPU = 6;
+  const out: MetricSeries[] = [];
+  let seriesIndex = 0;
+  // Group by gpu so round-robin lane assignment is stable across frames.
+  const sortedKeys = [...ring.keys()].sort();
+  const perGpu = new Map<number, number>();
+  for (const k of sortedKeys) {
+    const samples = ring.get(k);
+    if (!samples || samples.length < 2) continue;
+    const parts = k.split(":");
+    const gpu = Number(parts[1]);
+    const laneSlot = perGpu.get(gpu) ?? 0;
+    perGpu.set(gpu, laneSlot + 1);
+    const laneIdx = gpu * LANES_PER_GPU + (laneSlot % 3);
+    if (!lanes[laneIdx]) continue;
+    const n = samples.length;
+    const pts = new Float64Array(n * 2);
+    let vmin = Infinity;
+    let vmax = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const v = samples[i].value;
+      if (v < vmin) vmin = v;
+      if (v > vmax) vmax = v;
+    }
+    const span = Math.max(1e-9, vmax - vmin);
+    for (let i = 0; i < n; i++) {
+      pts[i * 2] = samples[i].tsNs;
+      pts[i * 2 + 1] = (samples[i].value - vmin) / span;
+    }
+    out.push({
+      lane: laneIdx,
+      color: [0.45, 0.9, 0.55],
+      points: pts,
+    });
+    seriesIndex++;
+  }
+  void seriesIndex;
   return out;
 }
 
