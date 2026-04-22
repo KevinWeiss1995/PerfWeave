@@ -118,6 +118,8 @@ export function App() {
         spikes={spikes}
         onSpikeClick={onSpikeClick}
         liveSeries={live ? liveStream.series : null}
+        liveKernels={live ? liveStream.kernels : null}
+        liveKernelsTick={liveStream.kernelsTick}
         liveLastTsNs={liveStream.lastTsNs}
         live={live}
       />
