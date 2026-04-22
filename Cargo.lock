@@ -97,6 +97,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrow"
 version = "55.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1997,33 +2006,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "perfweave-api"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "anyhow",
- "arrow",
- "arrow-ipc",
- "async-graphql",
- "async-graphql-axum",
- "axum 0.8.9",
- "bytes",
- "clap",
- "clickhouse",
- "futures",
- "perfweave-common",
- "perfweave-proto",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "perfweave-cli"
 version = "0.1.0"
 dependencies = [
@@ -2032,36 +2014,12 @@ dependencies = [
  "clickhouse",
  "nvml-wrapper",
  "perfweave-agent",
- "perfweave-api",
- "perfweave-collector",
  "perfweave-common",
  "perfweave-proto",
+ "perfweave-server",
  "serde",
  "serde_json",
  "tokio",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "perfweave-collector"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "anyhow",
- "bytes",
- "clap",
- "clickhouse",
- "futures",
- "parking_lot",
- "perfweave-common",
- "perfweave-proto",
- "prost",
- "serde",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -2100,8 +2058,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "perfweave-api",
  "perfweave-common",
+ "perfweave-server",
  "tokio",
  "tracing",
 ]
@@ -2114,6 +2072,38 @@ dependencies = [
  "prost-types",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "perfweave-server"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "arc-swap",
+ "arrow",
+ "arrow-ipc",
+ "async-graphql",
+ "async-graphql-axum",
+ "axum 0.8.9",
+ "bytes",
+ "clap",
+ "clickhouse",
+ "futures",
+ "parking_lot",
+ "perfweave-common",
+ "perfweave-proto",
+ "prost",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2874,6 +2864,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
