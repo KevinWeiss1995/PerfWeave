@@ -47,6 +47,34 @@ html, body, #root {
 .topbar .status { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
 .topbar .zoom-hint { margin-left: auto; color: var(--fg-dim); }
 
+.live-pill {
+  appearance: none;
+  border: 1px solid #2a323c;
+  background: #161b22;
+  color: var(--fg-dim);
+  font: 11px/1 -apple-system, system-ui, sans-serif;
+  letter-spacing: 0.5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.live-pill.on.ok {
+  background: #0f2a1a;
+  color: #7ae6a9;
+  border-color: #1b5c37;
+  box-shadow: 0 0 12px rgba(99, 211, 166, 0.25);
+}
+.live-pill.on.warn {
+  background: #2a220f;
+  color: var(--accent-hot);
+  border-color: #5c4b1b;
+}
+.live-pill.off {
+  background: #161b22;
+}
+.live-pill:disabled { opacity: 0.5; cursor: not-allowed; }
+
 .timeline {
   position: relative;
   grid-row: 2;
