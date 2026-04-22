@@ -1,5 +1,8 @@
 pub mod synthetic;
 
+#[cfg(target_os = "linux")]
+pub mod tegra;
+
 #[cfg(feature = "nvml")]
 pub mod nvml;
 
