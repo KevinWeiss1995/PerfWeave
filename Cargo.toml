@@ -4,8 +4,7 @@ members = [
     "crates/perfweave-common",
     "crates/perfweave-proto",
     "crates/perfweave-agent",
-    "crates/perfweave-collector",
-    "crates/perfweave-api",
+    "crates/perfweave-server",
     "crates/perfweave-cli",
     "crates/perfweave-cupti-inject",
     "crates/perfweave-nsys-import",
@@ -21,7 +20,7 @@ repository = "https://github.com/perfweave/perfweave"
 [workspace.dependencies]
 # async + errors
 tokio = { version = "1.38", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 anyhow = "1.0"
 thiserror = "1.0"
@@ -63,6 +62,7 @@ ahash = "0.8"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
+arc-swap = "1.7"
 
 # NVIDIA
 nvml-wrapper = "0.10"
