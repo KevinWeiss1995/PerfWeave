@@ -26,6 +26,9 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 mod activity;
+mod callback;
+#[allow(dead_code)]
+mod pm;
 mod transport;
 
 pub use activity::ActivityBuffer;
