@@ -20,6 +20,7 @@ import { generateSynthetic } from "./synthetic";
 import { fetchTimeline, resolveStrings } from "../api";
 import { classify, METRIC_SLOTS, type MetricSpec } from "./metrics";
 import type { SpikeMarker } from "../panels/SidePanel";
+import type { LiveKernel } from "../live";
 
 export interface Selection {
   kind: "event";
@@ -40,6 +41,12 @@ interface Props {
   /** When set, metric lanes render from this client-side live ring instead
    *  of Arrow tiles. Keys are `${nodeId}:${gpuId}:${metricId}`. */
   liveSeries?: Map<string, { tsNs: number; value: number }[]> | null;
+  /** When set, the activity (kernels) lane renders from this client-side
+   *  kernel ring fed by `/api/live/kernels`. */
+  liveKernels?: LiveKernel[] | null;
+  /** Bumps ~10 Hz when new kernels arrive. Used as the effect heartbeat
+   *  since the ring reference itself is stable. */
+  liveKernelsTick?: number;
   /** Server's most recent sample ts_ns (from the SSE stream). Used to anchor
    *  the virtual clock so the tape scrolls in lockstep with the backend. */
   liveLastTsNs?: bigint;
@@ -72,6 +79,8 @@ export function Timeline({
   spikes = [],
   onSpikeClick,
   liveSeries = null,
+  liveKernels = null,
+  liveKernelsTick = 0,
   liveLastTsNs = 0n,
   live = false,
 }: Props) {
@@ -79,11 +88,23 @@ export function Timeline({
   const mainRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<TimelineRenderer | null>(null);
   const [fps, setFps] = useState(0);
-  const [nowNs, setNowNs] = useState<bigint>(() => liveLastTsNs || BigInt(Date.now()) * 1_000_000n);
   const measureAnchor = useRef<bigint | null>(null);
 
-  // --- Resolve metric_id → name lazily via /graphql. We batch all unknown
-  //     ids and query once per new discovery.
+  // Refs that the RAF loop reads on every frame. We keep these out of React
+  // state because setting state on each frame (a) triggers re-renders and
+  // (b) causes any effect that depends on them to tear down and re-fire,
+  // which turns a 60 fps loop into a 1 fps loop.
+  const nowNsRef = useRef<bigint>(liveLastTsNs || BigInt(Date.now()) * 1_000_000n);
+  const viewportRef = useRef(viewport);
+  const liveRef = useRef(live);
+  const liveLastTsNsRef = useRef(liveLastTsNs);
+  useEffect(() => { viewportRef.current = viewport; }, [viewport]);
+  useEffect(() => { liveRef.current = live; }, [live]);
+  useEffect(() => { liveLastTsNsRef.current = liveLastTsNs; }, [liveLastTsNs]);
+
+  // --- Resolve metric_id → name lazily via /graphql. Keyed off
+  //     liveLastTsNs because the live ring's Map reference is stable, so
+  //     we need an explicit heartbeat to notice new metric_ids.
   const [metricCatalog, setMetricCatalog] = useState<Map<string, MetricSpec>>(new Map());
   useEffect(() => {
     if (!liveSeries) return;
@@ -116,7 +137,7 @@ export function Timeline({
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [liveSeries, metricCatalog]);
+  }, [liveSeries, liveLastTsNs, metricCatalog]);
 
   // --- Lane layout. Stable: per GPU, 6 metric slots then 3 activity lanes.
   const lanes: LaneLayout[] = useMemo(() => {
@@ -195,7 +216,9 @@ export function Timeline({
     };
   }, [lanes]);
 
-  // --- Load data whenever viewport/mode changes.
+  // --- Load data when the viewport or live heartbeat ticks. In live mode
+  //     `liveLastTsNs` changes ~1 Hz and is our signal that the ring has
+  //     fresh samples (the Map reference itself is stable by design).
   useEffect(() => {
     const r = rendererRef.current;
     if (!r) return;
@@ -215,8 +238,9 @@ export function Timeline({
     }
 
     if (liveSeries) {
-      r.setMetrics(liveRingToMetrics(liveSeries, metricCatalog, LANES_PER_GPU, nowNs));
-      // Leave last-known activity alone; SSE kernels path will feed it later.
+      r.setMetrics(
+        liveRingToMetrics(liveSeries, metricCatalog, LANES_PER_GPU, nowNsRef.current),
+      );
       return;
     }
 
@@ -233,12 +257,27 @@ export function Timeline({
         console.warn("timeline fetch failed; staying on previous data:", e);
       }
     })();
-  }, [viewport, useSynthetic, lanes, liveSeries, metricCatalog, nowNs]);
+  }, [viewport, useSynthetic, lanes, liveSeries, liveLastTsNs, metricCatalog]);
 
-  // --- RAF: advance virtual clock, render.
+  // --- Rebuild activity (kernels) lane from the live kernel ring. Keyed
+  //     on liveKernelsTick (~10 Hz heartbeat) instead of the ring
+  //     reference, which is stable.
+  useEffect(() => {
+    const r = rendererRef.current;
+    if (!r) return;
+    if (useSynthetic) return;
+    if (!liveKernels) return;
+    r.setActivity(liveKernelsToBatches(liveKernels, LANES_PER_GPU));
+  }, [liveKernels, liveKernelsTick, useSynthetic]);
+
+  // --- RAF: advance virtual clock, render. This effect mounts ONCE and
+  //     reads everything through refs. Putting `nowNs` in state caused the
+  //     effect to tear down on every frame, which is what gave us the
+  //     pathological 1 fps.
   useEffect(() => {
     let frames: number[] = [];
     let raf = 0;
+    let lastFpsSet = 0;
     const loop = (t: number) => {
       const r = rendererRef.current;
       const c = canvasRef.current;
@@ -246,15 +285,20 @@ export function Timeline({
       // Virtual clock. In live mode we advance by wall time so the tape
       // scrolls smoothly between 1 Hz samples. When a fresher server ts
       // arrives we snap forward so we stay aligned.
-      if (live) {
+      if (liveRef.current) {
         const wall = BigInt(Date.now()) * 1_000_000n;
-        const anchored = liveLastTsNs > 0n && liveLastTsNs > wall ? liveLastTsNs : wall;
-        setNowNs((prev) => (anchored > prev ? anchored : prev + 16_666_666n));
+        const last = liveLastTsNsRef.current;
+        const anchored = last > 0n && last > wall ? last : wall;
+        nowNsRef.current =
+          anchored > nowNsRef.current ? anchored : nowNsRef.current + 16_666_666n;
       }
 
       if (r && c) {
-        const endNs = live ? nowNs : viewport.endNs;
-        const startNs = live ? endNs - (viewport.endNs - viewport.startNs) : viewport.startNs;
+        const vp = viewportRef.current;
+        const endNs = liveRef.current ? nowNsRef.current : vp.endNs;
+        const startNs = liveRef.current
+          ? endNs - (vp.endNs - vp.startNs)
+          : vp.startNs;
         r.render({
           startNs,
           endNs,
@@ -264,21 +308,29 @@ export function Timeline({
       }
       frames.push(t);
       while (frames.length > 0 && t - frames[0] > 1000) frames.shift();
-      setFps(frames.length);
+      // Throttle fps setState to at most every 500ms so we don't re-render
+      // the whole React tree on every frame.
+      if (t - lastFpsSet > 500) {
+        setFps(frames.length);
+        lastFpsSet = t;
+      }
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [viewport, live, liveLastTsNs, nowNs]);
+  }, []);
 
-  // --- Effective viewport helper for pointer math.
+  // --- Effective viewport helper for pointer math. Used outside the RAF
+  //     loop (wheel/click handlers and axis-tick memos). Relies on React
+  //     re-rendering when liveLastTsNs changes, which happens ~1 Hz.
   const effViewport = useCallback(() => {
     if (live) {
       const range = viewport.endNs - viewport.startNs;
+      const nowNs = nowNsRef.current;
       return { startNs: nowNs - range, endNs: nowNs };
     }
     return viewport;
-  }, [live, nowNs, viewport]);
+  }, [live, viewport, liveLastTsNs]);
 
   // --- Wheel: plain = horizontal pan, Ctrl/Cmd = zoom at cursor.
   const onWheel = (e: React.WheelEvent) => {
@@ -330,7 +382,7 @@ export function Timeline({
   // Double-click: snap to "now" with the default window. Feels like the
   // equivalent of hitting Home.
   const onDoubleClick = () => {
-    const end = live ? nowNs : BigInt(Date.now()) * 1_000_000n;
+    const end = live ? nowNsRef.current : BigInt(Date.now()) * 1_000_000n;
     onViewportChange({ startNs: end - LIVE_WINDOW_NS, endNs: end });
   };
 
@@ -602,10 +654,48 @@ function arrowToMetrics(
   return out;
 }
 
+// Convert the live kernel ring → renderer InstanceBatches. One batch per
+// GPU drops into the "kernels" activity lane. Duration clamps to 1 ns so
+// zero-length entries still get a 1 px bar at close zooms.
+function liveKernelsToBatches(kernels: LiveKernel[], lanesPerGpu: number): InstanceBatch[] {
+  if (kernels.length === 0) return [];
+  const perGpu = new Map<number, { s: number[]; w: number[]; corr: number[] }>();
+  for (const k of kernels) {
+    let g = perGpu.get(k.gpuId);
+    if (!g) {
+      g = { s: [], w: [], corr: [] };
+      perGpu.set(k.gpuId, g);
+    }
+    g.s.push(k.tsNs);
+    g.w.push(Math.max(1, k.durationNs));
+    // Correlation lo32 — store the lower 32 bits of name_id (u64 string)
+    // so clicking a kernel bar can highlight all sibling launches of the
+    // same kernel. We parse the string as BigInt and mask.
+    try {
+      g.corr.push(Number(BigInt(k.correlationId) & 0xffffffffn));
+    } catch {
+      g.corr.push(0);
+    }
+  }
+  const out: InstanceBatch[] = [];
+  for (const [gpuId, g] of perGpu) {
+    const laneIdx = gpuId * lanesPerGpu + METRIC_SLOTS + 0; // kernels is activity slot 0
+    out.push({
+      lane: laneIdx,
+      colorId: 0, // KERNEL color from shader palette
+      starts: Float64Array.from(g.s),
+      widths: Float64Array.from(g.w),
+      corrLo: Float32Array.from(g.corr),
+    });
+  }
+  return out;
+}
+
 // Convert the client-side live ring → renderer MetricSeries. If a metric
 // has been classified, use its fixed yMin/yMax; otherwise autoscale. Also
-// extrapolates a flat segment to "nowNs" so the trailing edge always
-// reaches the right side of the viewport.
+// extrapolates a flat segment well past "now" so that the trailing edge
+// of the line always reaches the right side of the viewport, even between
+// 1 Hz SSE frames while the RAF-driven virtual clock keeps scrolling.
 function liveRingToMetrics(
   ring: Map<string, { tsNs: number; value: number }[]>,
   catalog: Map<string, MetricSpec>,
@@ -614,6 +704,11 @@ function liveRingToMetrics(
 ): MetricSeries[] {
   const out: MetricSeries[] = [];
   const nowF = Number(nowNs);
+  // 10 minutes of flat tail. The shader clips to the viewport anyway, and
+  // 10 min covers every zoom level we care about for MVP (max viewport is
+  // 24 h, but nobody looks at >5 min live). Keeps us from recomputing the
+  // ring on every RAF frame.
+  const TAIL_NS = 600 * 1_000_000_000;
   for (const [key, samples] of ring) {
     if (samples.length < 1) continue;
     const [, gpuStr, mid] = key.split(":");
@@ -628,9 +723,8 @@ function liveRingToMetrics(
       ts[i] = samples[i].tsNs;
       vs[i] = samples[i].value;
     }
-    // Extrapolate: hold the last value forward to "now". Without this, the
-    // line would stop ~1s behind the right edge between server ticks.
-    ts[samples.length] = Math.max(ts[samples.length - 1], nowF);
+    const lastTs = ts[samples.length - 1];
+    ts[samples.length] = Math.max(lastTs, nowF) + TAIL_NS;
     vs[samples.length] = vs[samples.length - 1];
 
     pushSeries(out, laneIdx, spec, ts, vs);
