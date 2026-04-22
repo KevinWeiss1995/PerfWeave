@@ -8,14 +8,14 @@
 //!   pixels:     u32, timeline width in CSS pixels (picks the LOD)
 //!   kind:       "activity" | "metric" | "raw"  (default picks by pixels)
 
-use crate::{
+use crate::api::{
     arrow_tile::{
         activity_to_arrow, metric_to_arrow, raw_to_arrow,
         ActivityTileRows, MetricTileRows, RawEventRows,
     },
-    ch::Ch,
     lod::{choose_tile, should_serve_raw},
 };
+use crate::store::Ch;
 use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
