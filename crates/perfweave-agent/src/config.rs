@@ -3,7 +3,7 @@ use clap::Parser;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "perfweave-agent")]
 pub struct AgentConfig {
-    /// Collector gRPC endpoint (e.g. http://127.0.0.1:7700).
+    /// Collector gRPC endpoint (e.g. http://127.0.0.1:7778).
     #[arg(long, env = "PERFWEAVE_COLLECTOR", default_value_t = format!("http://127.0.0.1:{}", perfweave_common::ports::COLLECTOR_GRPC))]
     pub collector: String,
 
