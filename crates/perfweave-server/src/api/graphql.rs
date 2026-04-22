@@ -3,22 +3,35 @@
 //!   - metric + string dictionary lookup
 //!   - spike queries
 //!   - correlation lookup (given correlation_id, return the paired events)
+//!   - kernel SOL drilldown
+//!   - on-demand kernel-replay profiling (mutation)
 //!
-//! Kept narrow on purpose. The timeline data path is Arrow IPC, not GraphQL.
+//! The timeline data path is Arrow IPC, and the live-tail path is SSE;
+//! everything else is GraphQL.
 
-use crate::ch::Ch;
+use crate::replay::AgentRegistry;
+use crate::store::{sink::Sink, Ch};
 use async_graphql::{Context, EmptySubscription, Object, Schema, SimpleObject};
 use clickhouse::Row;
+use perfweave_proto::v1::{KernelSol, ProfileRequest};
 use serde::Deserialize;
+use std::sync::Arc;
+use tokio_stream::StreamExt;
 
 pub type AppSchema = Schema<Query, Mutation, EmptySubscription>;
 
 pub struct Query;
 pub struct Mutation;
 
-pub fn build_schema(ch: Ch) -> AppSchema {
+pub fn build_schema(
+    ch: Ch,
+    sink: Arc<Sink>,
+    agents: Arc<AgentRegistry>,
+) -> AppSchema {
     Schema::build(Query, Mutation, EmptySubscription)
         .data(ch)
+        .data(sink)
+        .data(agents)
         .finish()
 }
 
@@ -78,6 +91,33 @@ pub enum Bottleneck {
 }
 
 #[derive(SimpleObject, Debug, Clone)]
+pub struct KernelInWindow {
+    pub correlation_id: u64,
+    pub name_id: u64,
+    pub name: String,
+    pub ts_ns: u64,
+    pub duration_ns: u64,
+    pub gpu_id: u8,
+    /// Speed-of-Light numbers (populated if we've profiled this kernel).
+    pub sol: Option<KernelSolRow>,
+}
+
+#[derive(SimpleObject, Debug, Clone)]
+pub struct KernelSolRow {
+    pub sm_active_pct: f64,
+    pub achieved_occupancy_pct: f64,
+    pub dram_bw_pct: f64,
+    pub l1_bw_pct: f64,
+    pub l2_bw_pct: f64,
+    pub inst_throughput_pct: f64,
+    pub arithmetic_intensity: f64,
+    pub achieved_gflops: f64,
+    pub bound: String,
+    pub confidence: String,
+    pub source: String,
+}
+
+#[derive(SimpleObject, Debug, Clone)]
 pub struct SpikeContext {
     /// The spike identity fields (so the client can match back to a row).
     pub bucket_start_ns: u64,
@@ -92,6 +132,19 @@ pub struct SpikeContext {
     pub avg_gpu_util: f64,
     /// Top kernels by total duration in the classification window.
     pub top_kernels: Vec<TopKernelsInWindow>,
+    /// All kernels in ±500ms window, joined with kernel_sol if available.
+    /// Used by SpikeDrilldown to render a Gantt + SOL cards in one hop.
+    pub kernels_in_window: Vec<KernelInWindow>,
+}
+
+#[derive(SimpleObject, Debug, Clone)]
+pub struct ProfileKernelsAck {
+    pub node_id: u32,
+    pub requested: u32,
+    pub completed: u32,
+    /// Resulting SOL rows. The UI can also watch /api/live if it wants the
+    /// same data via SSE; returning here is the low-latency path.
+    pub results: Vec<KernelSolRow>,
 }
 
 #[Object]
@@ -219,16 +272,7 @@ impl Query {
             .collect())
     }
 
-    /// Drill-down for a specific spike. Gives the UI everything it needs to
-    /// explain "why is GPU slow right here?" in one hop:
-    ///   - classify as compute-bound vs memory-bound using average NVML
-    ///     utilization around the spike
-    ///   - list the top-3 kernels live during the same window
-    ///   - include the metric name so the badge tooltip is meaningful
-    ///
-    /// Window is the spike bucket expanded by ±500ms, which is large enough
-    /// to catch the kernel wave responsible for the spike without pulling in
-    /// neighbor workloads.
+    /// Drill-down for a specific spike.
     async fn spike_context(
         &self,
         ctx: &Context<'_>,
@@ -259,11 +303,15 @@ impl Query {
             avg_gpu_util: f64,
             avg_mem_util: f64,
         }
+        // NVML names: gpu.util.percent (SM utilization) and gpu.mem.util.percent
+        // (memory controller utilization). We fall back to legacy names
+        // "gpu_util"/"mem_util" if the strings table still has them for
+        // backward compatibility with pre-rework imports.
         let util_sql = format!(
             r#"
             SELECT
-              avgIf(value, name_id = (SELECT id FROM strings FINAL WHERE text = 'gpu_util' LIMIT 1)) AS avg_gpu_util,
-              avgIf(value, name_id = (SELECT id FROM strings FINAL WHERE text = 'mem_util' LIMIT 1)) AS avg_mem_util
+              avgIf(value, name_id IN (SELECT id FROM strings FINAL WHERE text IN ('gpu.util.percent','gpu_util'))) AS avg_gpu_util,
+              avgIf(value, name_id IN (SELECT id FROM strings FINAL WHERE text IN ('gpu.mem.util.percent','mem_util'))) AS avg_mem_util
             FROM events
             WHERE category = 'METRIC'
               AND gpu_id = {gpu_id}
@@ -278,10 +326,6 @@ impl Query {
             .await?
             .unwrap_or_default();
 
-        // Classifier: the GPU is memory-bound during the spike if memory
-        // controller utilization is meaningfully above SM utilization, and
-        // compute-bound in the opposite case. The 1.2× factor gives us
-        // hysteresis so we don't flip on noise.
         let bottleneck = if util.avg_mem_util > util.avg_gpu_util * 1.2 && util.avg_mem_util > 5.0 {
             Bottleneck::MemoryBound
         } else if util.avg_gpu_util > util.avg_mem_util * 1.2 && util.avg_gpu_util > 20.0 {
@@ -329,6 +373,93 @@ impl Query {
             })
             .collect();
 
+        // Full kernel list + SOL join, sorted by duration desc. LIMIT 32 is
+        // more than enough to render a Gantt; UI can paginate if it ever
+        // isn't.
+        let kiw_sql = format!(
+            r#"
+            SELECT
+                e.correlation_id    AS correlation_id,
+                e.name_id           AS name_id,
+                coalesce(s.text,'') AS name,
+                e.ts_ns             AS ts_ns,
+                e.duration_ns       AS duration_ns,
+                e.gpu_id            AS gpu_id,
+                argMax(k.sm_active_pct,          k.confidence) AS sm,
+                argMax(k.achieved_occupancy_pct, k.confidence) AS occ,
+                argMax(k.dram_bw_pct,            k.confidence) AS dram,
+                argMax(k.l1_bw_pct,              k.confidence) AS l1,
+                argMax(k.l2_bw_pct,              k.confidence) AS l2,
+                argMax(k.inst_throughput_pct,    k.confidence) AS inst,
+                argMax(k.arithmetic_intensity,   k.confidence) AS ai,
+                argMax(k.achieved_gflops,        k.confidence) AS gflops,
+                argMax(toString(k.bound),        k.confidence) AS bound,
+                argMax(toString(k.confidence),   k.confidence) AS confidence,
+                argMax(toString(k.source),       k.confidence) AS source,
+                count(k.correlation_id)                        AS sol_rows
+            FROM events AS e
+            LEFT JOIN strings    AS s FINAL ON s.id = e.name_id
+            LEFT JOIN kernel_sol AS k        ON k.correlation_id = e.correlation_id
+            WHERE e.category = 'KERNEL'
+              AND e.gpu_id = {gpu_id}
+              AND e.ts_ns >= {win_start}
+              AND e.ts_ns <  {win_end}
+            GROUP BY e.correlation_id, e.name_id, s.text, e.ts_ns, e.duration_ns, e.gpu_id
+            ORDER BY e.duration_ns DESC
+            LIMIT 32
+            "#
+        );
+        #[derive(Row, Deserialize)]
+        struct Kiw {
+            correlation_id: u64,
+            name_id: u64,
+            name: String,
+            ts_ns: u64,
+            duration_ns: u64,
+            gpu_id: u8,
+            sm: f32,
+            occ: f32,
+            dram: f32,
+            l1: f32,
+            l2: f32,
+            inst: f32,
+            ai: f32,
+            gflops: f32,
+            bound: String,
+            confidence: String,
+            source: String,
+            sol_rows: u64,
+        }
+        let kiw: Vec<Kiw> = ch.client.query(&kiw_sql).fetch_all().await?;
+        let kernels_in_window = kiw
+            .into_iter()
+            .map(|r| KernelInWindow {
+                correlation_id: r.correlation_id,
+                name_id: r.name_id,
+                name: r.name,
+                ts_ns: r.ts_ns,
+                duration_ns: r.duration_ns,
+                gpu_id: r.gpu_id,
+                sol: if r.sol_rows > 0 {
+                    Some(KernelSolRow {
+                        sm_active_pct: r.sm as f64,
+                        achieved_occupancy_pct: r.occ as f64,
+                        dram_bw_pct: r.dram as f64,
+                        l1_bw_pct: r.l1 as f64,
+                        l2_bw_pct: r.l2 as f64,
+                        inst_throughput_pct: r.inst as f64,
+                        arithmetic_intensity: r.ai as f64,
+                        achieved_gflops: r.gflops as f64,
+                        bound: r.bound,
+                        confidence: r.confidence,
+                        source: r.source,
+                    })
+                } else {
+                    None
+                },
+            })
+            .collect();
+
         Ok(SpikeContext {
             bucket_start_ns,
             bucket_width_ns,
@@ -339,22 +470,82 @@ impl Query {
             avg_mem_util: util.avg_mem_util,
             avg_gpu_util: util.avg_gpu_util,
             top_kernels,
+            kernels_in_window,
         })
     }
 }
 
 #[Object]
 impl Mutation {
-    /// Trigger spike recomputation for a time window. Normally this is done
-    /// on a timer; exposed here for tests and manual recomputation.
-    async fn recompute_spikes(
+    /// Ask the owning agent to replay-profile the given kernels and stream
+    /// back `KernelSol` rows. Persists every result into `kernel_sol` so
+    /// the next `spikeContext` for the same window returns high-confidence
+    /// numbers without a round-trip.
+    async fn profile_kernels(
         &self,
         ctx: &Context<'_>,
-        start_ns: u64,
-        end_ns: u64,
-    ) -> async_graphql::Result<u64> {
-        let ch = ctx.data::<Ch>()?;
-        let inserted = crate::imports::recompute_spikes_window(ch, start_ns, end_ns).await?;
-        Ok(inserted)
+        node_id: u32,
+        gpu_id: u32,
+        window_start_ns: u64,
+        window_end_ns: u64,
+        correlation_ids: Vec<u64>,
+        timeout_ms: Option<u32>,
+    ) -> async_graphql::Result<ProfileKernelsAck> {
+        let agents = ctx.data::<Arc<AgentRegistry>>()?;
+        let sink = ctx.data::<Arc<Sink>>()?;
+        let requested = correlation_ids.len() as u32;
+
+        let req = ProfileRequest {
+            gpu_id,
+            window_start_ns,
+            window_end_ns,
+            correlation_ids: correlation_ids.clone(),
+            name_ids: Vec::new(),
+            timeout_ms: timeout_ms.unwrap_or(5_000),
+        };
+        let mut stream = crate::replay::profile_kernels(agents, node_id, req)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("profile_kernels: {e:#}")))?;
+
+        let mut results: Vec<KernelSolRow> = Vec::new();
+        let mut completed: u32 = 0;
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(sol) => {
+                    completed += 1;
+                    // Persist and return.
+                    let sol_clone = sol.clone();
+                    if let Err(e) = sink.push_kernel_sol(node_id, sol_clone).await {
+                        tracing::warn!(error=%e, "failed to persist kernel_sol");
+                    }
+                    results.push(kernel_sol_to_row(&sol));
+                }
+                Err(e) => {
+                    tracing::warn!(error=%e, "replay stream error");
+                    break;
+                }
+            }
+        }
+
+        Ok(ProfileKernelsAck { node_id, requested, completed, results })
+    }
+}
+
+fn kernel_sol_to_row(s: &KernelSol) -> KernelSolRow {
+    let bound = format!("{:?}", s.bound());
+    let conf = format!("{:?}", s.confidence());
+    let src = format!("{:?}", s.source());
+    KernelSolRow {
+        sm_active_pct: s.sm_active_pct as f64,
+        achieved_occupancy_pct: s.achieved_occupancy_pct as f64,
+        dram_bw_pct: s.dram_bw_pct as f64,
+        l1_bw_pct: s.l1_bw_pct as f64,
+        l2_bw_pct: s.l2_bw_pct as f64,
+        inst_throughput_pct: s.inst_throughput_pct as f64,
+        arithmetic_intensity: s.arithmetic_intensity as f64,
+        achieved_gflops: s.achieved_gflops as f64,
+        bound,
+        confidence: conf,
+        source: src,
     }
 }
